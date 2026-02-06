@@ -1,14 +1,18 @@
 // ==UserScript==
-// @name         Pax Historia: Custom AI Backend (Gemini/Thinking/OpenRouter)
+// @name         Pax Historia: Custom AI Backend (Gemini/Thinking/OpenRouter/Copilot)
 // @namespace    http://tampermonkey.net/
-// @version      12.0
-// @description  Custom AI backend for Pax Historia with Settings GUI. Supports Google Gemini and OpenRouter.
+// @version      13.0
+// @description  Custom AI backend for Pax Historia with Settings GUI. Supports Google Gemini, OpenRouter and Copilot API.
 // @author       You
 // @match        https://paxhistoria.co/*
 // @match        https://www.paxhistoria.co/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_xmlhttpRequest
+// @connect      localhost
+// @connect      127.0.0.1
+// @connect      *
 // @run-at       document-start
 // ==/UserScript==
 
@@ -17,10 +21,12 @@
 
     // === DEFAULT SETTINGS ===
     const DEFAULTS = {
-        provider: "google", // 'google' or 'openrouter'
+        provider: "google", // 'google', 'openrouter', or 'copilot'
         apiKey: "",
         modelName: "gemini-3-flash-preview",
         openRouterModel: "google/gemini-2.0-flash-thinking-exp:free",
+        copilotBaseUrl: "http://localhost:4141",
+        copilotModel: "gpt-4.1",
         thinkingBudget: 4096
     };
 
@@ -31,6 +37,8 @@
             apiKey: GM_getValue("apiKey", DEFAULTS.apiKey),
             modelName: GM_getValue("modelName", DEFAULTS.modelName),
             openRouterModel: GM_getValue("openRouterModel", DEFAULTS.openRouterModel),
+            copilotBaseUrl: GM_getValue("copilotBaseUrl", DEFAULTS.copilotBaseUrl),
+            copilotModel: GM_getValue("copilotModel", DEFAULTS.copilotModel),
             thinkingBudget: GM_getValue("thinkingBudget", DEFAULTS.thinkingBudget)
         };
     }
@@ -40,7 +48,47 @@
         GM_setValue("apiKey", settings.apiKey);
         GM_setValue("modelName", settings.modelName);
         GM_setValue("openRouterModel", settings.openRouterModel);
+        GM_setValue("copilotBaseUrl", settings.copilotBaseUrl);
+        GM_setValue("copilotModel", settings.copilotModel);
         GM_setValue("thinkingBudget", settings.thinkingBudget);
+    }
+
+    // === COPILOT API HELPERS ===
+    function fetchCopilotApi(endpoint, options) {
+        return new Promise(function (resolve, reject) {
+            const baseUrl = (options?.baseUrl || loadSettings().copilotBaseUrl || DEFAULTS.copilotBaseUrl).replace(/\/$/, "");
+            const url = baseUrl + endpoint;
+            const method = options?.method || "GET";
+            const body = options?.body ? JSON.stringify(options.body) : undefined;
+
+            GM_xmlhttpRequest({
+                method: method,
+                url: url,
+                headers: { "Content-Type": "application/json" },
+                data: body,
+                onload: function (response) {
+                    try {
+                        const parsed = response.responseText ? JSON.parse(response.responseText) : {};
+                        resolve({ ok: response.status >= 200 && response.status < 300, status: response.status, data: parsed, text: response.responseText });
+                    } catch (e) {
+                        resolve({ ok: false, status: response.status, data: null, text: response.responseText });
+                    }
+                },
+                onerror: function () {
+                    reject(new Error("Network error connecting to Copilot API"));
+                }
+            });
+        });
+    }
+
+    function testCopilotConnection(baseUrl) {
+        return fetchCopilotApi("/v1/models", { baseUrl: baseUrl }).then(function (result) {
+            return {
+                online: result.ok,
+                models: result.ok && result.data?.data ? result.data.data.map(function (m) { return m.id; }) : [],
+                error: result.ok ? null : (result.text || "HTTP " + result.status)
+            };
+        });
     }
 
     // === GUI IMPLEMENTATION ===
@@ -51,17 +99,20 @@
 
         const modalHTML = `
             <div id="ph-ai-settings-modal" style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); z-index: 10000; display: flex; justify-content: center; align-items: center; font-family: sans-serif;">
-                <div style="background: #222; color: #fff; padding: 20px; border-radius: 8px; width: 400px; box-shadow: 0 4px 10px rgba(0,0,0,0.5);">
+                <div style="background: #222; color: #fff; padding: 20px; border-radius: 8px; width: 420px; box-shadow: 0 4px 10px rgba(0,0,0,0.5);">
                     <h2 style="margin-top: 0; border-bottom: 1px solid #444; padding-bottom: 10px;">AI Settings</h2>
                     
                     <label style="display: block; margin-top: 10px;">Provider:</label>
                     <select id="ph-provider" style="width: 100%; padding: 8px; margin-top: 5px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px;">
                         <option value="google" ${settings.provider === 'google' ? 'selected' : ''}>Google AI Studio</option>
                         <option value="openrouter" ${settings.provider === 'openrouter' ? 'selected' : ''}>OpenRouter</option>
+                        <option value="copilot" ${settings.provider === 'copilot' ? 'selected' : ''}>Copilot API (local)</option>
                     </select>
 
-                    <label style="display: block; margin-top: 10px;">API Key:</label>
-                    <input type="text" id="ph-api-key" value="${settings.apiKey}" style="width: 100%; padding: 8px; margin-top: 5px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px;" placeholder="Enter API Key">
+                    <div id="ph-api-key-container" style="display: ${settings.provider === 'copilot' ? 'none' : 'block'};">
+                        <label style="display: block; margin-top: 10px;">API Key:</label>
+                        <input type="text" id="ph-api-key" value="${settings.apiKey}" style="width: 100%; padding: 8px; margin-top: 5px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px;" placeholder="Enter API Key">
+                    </div>
 
                     <div id="ph-google-fields" style="display: ${settings.provider === 'google' ? 'block' : 'none'};">
                         <label style="display: block; margin-top: 10px;">Model Name:</label>
@@ -74,6 +125,21 @@
                     <div id="ph-openrouter-fields" style="display: ${settings.provider === 'openrouter' ? 'block' : 'none'};">
                         <label style="display: block; margin-top: 10px;">OpenRouter Model:</label>
                         <input type="text" id="ph-or-model-name" value="${settings.openRouterModel}" style="width: 100%; padding: 8px; margin-top: 5px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px;">
+                    </div>
+
+                    <div id="ph-copilot-fields" style="display: ${settings.provider === 'copilot' ? 'block' : 'none'};">
+                        <label style="display: block; margin-top: 10px;">Base URL (sin API key):</label>
+                        <input type="text" id="ph-copilot-base-url" value="${settings.copilotBaseUrl}" style="width: 100%; padding: 8px; margin-top: 5px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px;" placeholder="http://localhost:4141">
+                        <div style="display: flex; gap: 8px; align-items: center; margin-top: 10px;">
+                            <label style="flex: 1;">Model:</label>
+                            <select id="ph-copilot-model" style="flex: 2; padding: 8px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px;">
+                                <option value="${settings.copilotModel}">${settings.copilotModel}</option>
+                            </select>
+                        </div>
+                        <div style="margin-top: 10px; display: flex; align-items: center; gap: 8px;">
+                            <button id="ph-test-copilot-btn" style="padding: 6px 12px; background: #28a745; color: #fff; border: none; border-radius: 4px; cursor: pointer;">Test conexion</button>
+                            <span id="ph-test-status" style="font-size: 12px;"></span>
+                        </div>
                     </div>
 
                     <div style="margin-top: 20px; text-align: right;">
@@ -89,29 +155,72 @@
         document.body.appendChild(div);
 
         // Event Listeners
-        document.getElementById('ph-provider').addEventListener('change', (e) => {
-            const isGoogle = e.target.value === 'google';
+        function updateProviderVisibility() {
+            const provider = document.getElementById('ph-provider').value;
+            const isGoogle = provider === 'google';
+            const isOpenRouter = provider === 'openrouter';
+            const isCopilot = provider === 'copilot';
             document.getElementById('ph-google-fields').style.display = isGoogle ? 'block' : 'none';
-            document.getElementById('ph-openrouter-fields').style.display = isGoogle ? 'none' : 'block';
+            document.getElementById('ph-openrouter-fields').style.display = isOpenRouter ? 'block' : 'none';
+            document.getElementById('ph-copilot-fields').style.display = isCopilot ? 'block' : 'none';
+            document.getElementById('ph-api-key-container').style.display = isCopilot ? 'none' : 'block';
+        }
+
+        document.getElementById('ph-provider').addEventListener('change', updateProviderVisibility);
+
+        document.getElementById('ph-test-copilot-btn').addEventListener('click', function () {
+            const statusEl = document.getElementById('ph-test-status');
+            const selectEl = document.getElementById('ph-copilot-model');
+            const baseUrl = document.getElementById('ph-copilot-base-url').value.trim() || DEFAULTS.copilotBaseUrl;
+            statusEl.textContent = 'Probando...';
+            statusEl.style.color = '#ffc107';
+            testCopilotConnection(baseUrl).then(function (result) {
+                if (result.online) {
+                    statusEl.textContent = 'Conectado (' + result.models.length + ' modelos)';
+                    statusEl.style.color = '#28a745';
+                    const currentVal = selectEl.value;
+                    selectEl.innerHTML = '';
+                    result.models.forEach(function (modelId, index) {
+                        const opt = document.createElement('option');
+                        opt.value = modelId;
+                        opt.textContent = modelId;
+                        if (modelId === currentVal || (index === 0 && !currentVal)) opt.selected = true;
+                        selectEl.appendChild(opt);
+                    });
+                    if (!selectEl.value && result.models.length) selectEl.value = result.models[0];
+                } else {
+                    statusEl.textContent = 'Error: ' + (result.error || 'sin respuesta');
+                    statusEl.style.color = '#dc3545';
+                }
+            }).catch(function (err) {
+                statusEl.textContent = 'Error: ' + (err.message || 'red');
+                statusEl.style.color = '#dc3545';
+            });
         });
 
-        document.getElementById('ph-cancel-btn').addEventListener('click', () => {
+        document.getElementById('ph-cancel-btn').addEventListener('click', function () {
             document.getElementById('ph-ai-settings-modal').remove();
         });
 
-        document.getElementById('ph-save-btn').addEventListener('click', () => {
+        document.getElementById('ph-save-btn').addEventListener('click', function () {
             const newSettings = {
                 provider: document.getElementById('ph-provider').value,
                 apiKey: document.getElementById('ph-api-key').value,
                 modelName: document.getElementById('ph-model-name').value,
                 openRouterModel: document.getElementById('ph-or-model-name').value,
-                thinkingBudget: parseInt(document.getElementById('ph-thinking-budget').value) || 4096
+                copilotBaseUrl: document.getElementById('ph-copilot-base-url').value.trim() || DEFAULTS.copilotBaseUrl,
+                copilotModel: document.getElementById('ph-copilot-model').value || DEFAULTS.copilotModel,
+                thinkingBudget: parseInt(document.getElementById('ph-thinking-budget').value, 10) || 4096
             };
             saveSettings(newSettings);
             alert('Settings saved! Reload the page for changes to take effect.');
             document.getElementById('ph-ai-settings-modal').remove();
             location.reload();
         });
+
+        if (settings.provider === 'copilot') {
+            setTimeout(function () { document.getElementById('ph-test-copilot-btn').click(); }, 100);
+        }
     }
 
     GM_registerMenuCommand("Open AI Settings", createSettingsModal);
@@ -125,10 +234,10 @@
         if (url && url.toString().includes('/api/simple-chat')) {
             const settings = loadSettings();
 
-            if (!settings.apiKey) {
+            const isCopilot = settings.provider === 'copilot';
+            const needsApiKey = !isCopilot;
+            if (needsApiKey && !settings.apiKey) {
                 console.warn("[PAX AI] No API Key configured. Please open settings via Tampermonkey menu.");
-                // Optionally alert user once per session or just fail gracefully
-                // alert("Pax Historia Hook: Please configure your API Key in the Tampermonkey menu!"); 
                 return originalFetch(url, options);
             }
 
@@ -240,6 +349,27 @@
 
                     const myJson = await myResponse.json();
                     responseText = myJson.choices?.[0]?.message?.content || "";
+                } else if (settings.provider === 'copilot') {
+                    // === COPILOT API (OpenAI-compatible, no API key) ===
+                    const baseUrl = (settings.copilotBaseUrl || DEFAULTS.copilotBaseUrl).replace(/\/$/, "");
+                    const copilotPayload = {
+                        model: settings.copilotModel || DEFAULTS.copilotModel,
+                        messages: [{ role: "user", content: finalPrompt }]
+                    };
+
+                    const copilotResult = await fetchCopilotApi("/v1/chat/completions", {
+                        baseUrl: baseUrl,
+                        method: "POST",
+                        body: copilotPayload
+                    });
+
+                    if (!copilotResult.ok) {
+                        const errMsg = copilotResult.data?.error?.message || copilotResult.text || "HTTP " + copilotResult.status;
+                        console.error("[PAX AI] Copilot API Error:", errMsg);
+                        throw new Error("Copilot API Error: " + errMsg);
+                    }
+
+                    responseText = copilotResult.data?.choices?.[0]?.message?.content || "";
                 }
 
                 // === CLEANUP & SURGERY ===
