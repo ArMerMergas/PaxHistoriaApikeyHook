@@ -19,6 +19,32 @@
 (function () {
     'use strict';
 
+    // === SCHEMA CONVERSION ===
+    // Game sends OpenAI-style schema: { name: "...", strict: true, schema: { ... } }
+    // Google API expects raw schema with "nullable: true" instead of type arrays like ["object", "null"]
+    function convertSchemaForGoogle(gameSchema) {
+        let schema = gameSchema && gameSchema.schema ? gameSchema.schema : gameSchema;
+        return fixTypeArrays(JSON.parse(JSON.stringify(schema)));
+    }
+
+    function fixTypeArrays(obj) {
+        if (!obj || typeof obj !== 'object') return obj;
+        if (Array.isArray(obj)) { obj.forEach(fixTypeArrays); return obj; }
+
+        // Convert type: ["object", "null"] → type: "object", nullable: true
+        if (Array.isArray(obj.type)) {
+            const nonNull = obj.type.filter(t => t !== 'null');
+            if (obj.type.includes('null')) obj.nullable = true;
+            obj.type = nonNull[0] || 'string';
+        }
+        // Remove unsupported fields
+        delete obj.additionalProperties;
+
+        if (obj.properties) Object.values(obj.properties).forEach(fixTypeArrays);
+        if (obj.items) fixTypeArrays(obj.items);
+        return obj;
+    }
+
     // === DEFAULT SETTINGS ===
     const DEFAULTS = {
         provider: "google", // 'google', 'openrouter', or 'copilot'
@@ -278,7 +304,7 @@
             try {
                 let userPrompt = "";
                 let isAction = false;
-                let schemaStr = "";
+                let gameSchema = null; // raw schema object from the game
 
                 if (options.body) {
                     const payload = JSON.parse(options.body);
@@ -289,17 +315,15 @@
                         isAction = false;
                     } else if (payload.jsonSchema) {
                         isAction = true;
-                        schemaStr = JSON.stringify(payload.jsonSchema);
+                        gameSchema = payload.jsonSchema;
                     }
                 }
 
                 console.log(`%c[PAX AI] TYPE: ${isAction ? "ACTION (RAW JSON)" : "CHAT (WRAPPER)"} | Provider: ${settings.provider}`, "background: blue; color: white; padding: 5px; font-weight: bold;");
 
                 let finalPrompt = userPrompt;
-                // For actions, add strict instruction
-                if (isAction && schemaStr) {
-                    finalPrompt += `\n\nTASK: Generate a valid JSON object matching this schema.\nSCHEMA: ${schemaStr}\n\nIMPORTANT: Return ONLY the JSON object. No markdown.`;
-                }
+                // Schema is now passed via native API params (responseSchema / response_format),
+                // NOT injected into prompt text — that caused garbled output.
 
                 let responseText = "";
 
@@ -314,6 +338,13 @@
                             thinking_budget: settings.thinkingBudget
                         }
                     };
+
+                    // Use native structured output for ACTION requests
+                    if (isAction && gameSchema) {
+                        genConfig.responseMimeType = "application/json";
+                        genConfig.responseSchema = convertSchemaForGoogle(gameSchema);
+                        console.log("%c[PAX AI] Using native responseSchema for structured output", "color: cyan");
+                    }
 
                     const googlePayload = {
                         contents: [{ parts: [{ text: finalPrompt }] }],
@@ -363,6 +394,15 @@
                             { role: "user", content: finalPrompt }
                         ]
                     };
+
+                    // Use native structured output for ACTION requests
+                    if (isAction && gameSchema) {
+                        orPayload.response_format = {
+                            type: "json_schema",
+                            json_schema: gameSchema
+                        };
+                        console.log("%c[PAX AI] Using response_format for structured output", "color: cyan");
+                    }
 
                     const myResponse = await originalFetch(orUrl, {
                         method: "POST",
