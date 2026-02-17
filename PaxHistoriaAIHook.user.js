@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pax Historia: Custom AI Backend (Gemini/Thinking/OpenRouter/Copilot)
 // @namespace    http://tampermonkey.net/
-// @version      13.0
+// @version      14.1
 // @description  Custom AI backend for Pax Historia with Settings GUI. Supports Google Gemini, OpenRouter and Copilot API.
 // @author       You
 // @match        https://paxhistoria.co/*
@@ -83,6 +83,234 @@
         GM_setValue("copilotBaseUrl", settings.copilotBaseUrl);
         GM_setValue("copilotModel", settings.copilotModel);
         GM_setValue("thinkingBudget", settings.thinkingBudget);
+    }
+
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY_MS = 1000;
+
+    function isRetryableError(errorOrStatus) {
+        if (typeof errorOrStatus === "number") {
+            return errorOrStatus === 429 || (errorOrStatus >= 500 && errorOrStatus < 600);
+        }
+        if (errorOrStatus instanceof Error) {
+            var msg = (errorOrStatus.message || "").toLowerCase();
+            return msg.includes("network") || msg.includes("timeout") || msg.includes("fetch");
+        }
+        return false;
+    }
+
+    function delay(ms) {
+        return new Promise(function (resolve) { setTimeout(resolve, ms); });
+    }
+
+    async function withRetry(asyncFn) {
+        var lastError;
+        for (var attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                return await asyncFn();
+            } catch (e) {
+                lastError = e;
+                var status = e.status || (e.response && e.response.status);
+                if (attempt < MAX_RETRIES && (isRetryableError(e) || isRetryableError(status))) {
+                    var backoff = RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+                    console.warn("[PAX AI] Retry " + attempt + "/" + MAX_RETRIES + " in " + backoff + "ms:", e.message || e);
+                    await delay(backoff);
+                } else {
+                    throw e;
+                }
+            }
+        }
+        throw lastError;
+    }
+
+    function getModelLabel(settings) {
+        if (settings.provider === "google") return settings.modelName;
+        if (settings.provider === "openrouter") return settings.openRouterModel.split("/").pop();
+        if (settings.provider === "copilot") return settings.copilotModel;
+        return "?";
+    }
+
+    function isInFooter(el) {
+        if (!el || !el.closest) return false;
+        return !!el.closest("footer, [class*='footer'], [class*='Footer']");
+    }
+
+    function findPaxHistoriaLogo() {
+        var header = document.querySelector("header");
+        if (header && !isInFooter(header)) {
+            var logoLink = header.querySelector('a[href="/games"], a[href^="/games"]');
+            if (logoLink && (logoLink.textContent || "").indexOf("Pax Historia") !== -1) return logoLink;
+        }
+        var mainNav = document.querySelector("nav");
+        if (mainNav && !isInFooter(mainNav)) {
+            var link = mainNav.querySelector('a[href="/games"], a[href^="/games"]');
+            if (link && (link.textContent || "").indexOf("Pax Historia") !== -1) return link;
+        }
+        var containers = document.querySelectorAll("header, nav");
+        for (var c = 0; c < containers.length; c++) {
+            var cont = containers[c];
+            if (isInFooter(cont)) continue;
+            var children = cont.children;
+            for (var i = 0; i < children.length; i++) {
+                var el = children[i];
+                if ((el.textContent || "").indexOf("Pax Historia") !== -1) return el;
+            }
+        }
+        return null;
+    }
+
+    function ensureParentFlex(element) {
+        var parent = element && element.parentNode;
+        if (parent) {
+            parent.style.setProperty("display", "flex", "important");
+            parent.style.setProperty("align-items", "center", "important");
+            parent.style.setProperty("gap", "0.5rem", "important");
+        }
+    }
+
+    function insertIndicatorAfterLogo(box, logoElement) {
+        var parent = logoElement.parentNode;
+        if (parent) {
+            if (logoElement.nextElementSibling) {
+                parent.insertBefore(box, logoElement.nextElementSibling);
+            } else {
+                parent.appendChild(box);
+            }
+            ensureParentFlex(box);
+        } else {
+            document.body.appendChild(box);
+        }
+    }
+
+    function createOrUpdateIndicator() {
+        if (!document.body) return;
+        var settings = loadSettings();
+        var existing = document.getElementById("ph-ai-indicator");
+        var label = settings.provider.toUpperCase() + " | " + getModelLabel(settings);
+        if (existing) {
+            existing.querySelector(".ph-ai-indicator-text").textContent = label;
+            existing.style.background = "rgb(40, 20, 60)";
+            existing.style.color = "#fafafa";
+            ensureParentFlex(existing);
+            return;
+        }
+        var box = document.createElement("button");
+        box.type = "button";
+        box.id = "ph-ai-indicator";
+        box.className = "ph-ai-indicator-btn";
+        box.innerHTML = '<span class="ph-ai-indicator-text">' + label + '</span>';
+        box.title = "Pax AI Hook - Click to open settings";
+        var indicatorBg = "rgb(40, 20, 60)";
+        var indicatorHover = "rgb(56, 32, 84)";
+        Object.assign(box.style, {
+            display: "inline-flex",
+            alignItems: "center",
+            gap: "0.5rem",
+            padding: "4px 12px",
+            border: "none",
+            borderRadius: "9999px",
+            fontSize: "0.875rem",
+            fontFamily: "inherit",
+            fontWeight: "500",
+            cursor: "pointer",
+            transition: "color 200ms, background-color 200ms",
+            flexShrink: "0",
+            background: indicatorBg,
+            color: "#fafafa"
+        });
+        box.addEventListener("click", function (e) {
+            e.preventDefault();
+            e.stopPropagation();
+            createSettingsModal();
+        });
+        box.addEventListener("mouseenter", function () {
+            box.style.backgroundColor = indicatorHover;
+            box.style.color = "#fafafa";
+        });
+        box.addEventListener("mouseleave", function () {
+            box.style.backgroundColor = indicatorBg;
+            box.style.color = "#fafafa";
+        });
+
+        var logoElement = findPaxHistoriaLogo();
+        if (logoElement) {
+            insertIndicatorAfterLogo(box, logoElement);
+        } else {
+            box.style.position = "fixed";
+            box.style.top = "12px";
+            box.style.left = "12px";
+            box.style.zIndex = "9999";
+            box.style.marginLeft = "0";
+            document.body.appendChild(box);
+        }
+    }
+
+    function ensureIndicator() {
+        function tryCreate() {
+            if (!document.body) return false;
+            if (document.getElementById("ph-ai-indicator")) return true;
+            var logoElement = findPaxHistoriaLogo();
+            createOrUpdateIndicator();
+            return true;
+        }
+
+        function run() {
+            if (tryCreate()) return;
+            var attempts = 0;
+            var maxAttempts = 100;
+            var interval = setInterval(function () {
+                attempts++;
+                if (tryCreate() || attempts >= maxAttempts) {
+                    clearInterval(interval);
+                }
+            }, 250);
+        }
+
+        function runWithObserver() {
+            if (tryCreate()) return;
+            var attempts = 0;
+            var maxAttempts = 100;
+            var interval = setInterval(function () {
+                attempts++;
+                if (tryCreate() || attempts >= maxAttempts) {
+                    clearInterval(interval);
+                }
+            }, 250);
+            if (document.body && !document.getElementById("ph-ai-indicator")) {
+                var observer = new MutationObserver(function () {
+                    if (document.getElementById("ph-ai-indicator")) return;
+                    if (tryCreate()) observer.disconnect();
+                });
+                observer.observe(document.body, { childList: true, subtree: true });
+                setTimeout(function () { observer.disconnect(); }, 15000);
+            }
+        }
+
+        if (document.readyState === "loading") {
+            document.addEventListener("DOMContentLoaded", runWithObserver);
+        } else {
+            runWithObserver();
+        }
+        window.addEventListener("load", function () {
+            createOrUpdateIndicator();
+        });
+        [1000, 2500, 5000].forEach(function (delayMs) {
+            setTimeout(function () {
+                createOrUpdateIndicator();
+            }, delayMs);
+        });
+        var observerRemoval = new MutationObserver(function () {
+            if (!document.getElementById("ph-ai-indicator") && document.body) {
+                createOrUpdateIndicator();
+            }
+        });
+        function startRemovalObserver() {
+            if (!document.body) return;
+            observerRemoval.observe(document.body, { childList: true, subtree: true });
+            setTimeout(function () { observerRemoval.disconnect(); }, 20000);
+        }
+        if (document.body) startRemovalObserver();
+        else document.addEventListener("DOMContentLoaded", startRemovalObserver);
     }
 
     // === COPILOT API HELPERS ===
@@ -192,14 +420,14 @@
                     </div>
 
                     <div id="ph-copilot-fields" style="display: ${settings.provider === 'copilot' ? 'block' : 'none'};">
-                        <label for="ph-copilot-base-url">Base URL (sin API key):</label>
+                        <label for="ph-copilot-base-url">Base URL (no API key):</label>
                         <input type="text" id="ph-copilot-base-url" value="${settings.copilotBaseUrl}" placeholder="http://localhost:4141">
                         <label for="ph-copilot-model">Model:</label>
                         <select id="ph-copilot-model" size="8">
                             <option value="${settings.copilotModel}">${settings.copilotModel}</option>
                         </select>
                         <div style="margin-top: 10px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px;">
-                            <button id="ph-test-copilot-btn" style="background: #28a745; color: #fff;">Test conexion</button>
+                            <button id="ph-test-copilot-btn" style="background: #28a745; color: #fff;">Test connection</button>
                             <span id="ph-test-status" style="font-size: 0.85rem;"></span>
                         </div>
                     </div>
@@ -230,56 +458,69 @@
 
         document.getElementById('ph-provider').addEventListener('change', updateProviderVisibility);
 
-        document.getElementById('ph-test-copilot-btn').addEventListener('click', function () {
+        function populateCopilotModels() {
             const statusEl = document.getElementById('ph-test-status');
             const selectEl = document.getElementById('ph-copilot-model');
             const baseUrl = document.getElementById('ph-copilot-base-url').value.trim() || DEFAULTS.copilotBaseUrl;
-            statusEl.textContent = 'Probando...';
+            const savedModel = loadSettings().copilotModel;
+            statusEl.textContent = 'Testing...';
             statusEl.style.color = '#ffc107';
             testCopilotConnection(baseUrl).then(function (result) {
                 if (result.online) {
-                    statusEl.textContent = 'Conectado (' + result.models.length + ' modelos)';
+                    statusEl.textContent = 'Connected (' + result.models.length + ' models)';
                     statusEl.style.color = '#28a745';
-                    const currentVal = selectEl.value;
                     selectEl.innerHTML = '';
-                    result.models.forEach(function (modelId, index) {
+                    result.models.forEach(function (modelId) {
                         const opt = document.createElement('option');
                         opt.value = modelId;
                         opt.textContent = modelId;
-                        if (modelId === currentVal || (index === 0 && !currentVal)) opt.selected = true;
                         selectEl.appendChild(opt);
                     });
-                    if (!selectEl.value && result.models.length) selectEl.value = result.models[0];
+                    var keptVal = savedModel && result.models.indexOf(savedModel) !== -1 ? savedModel : result.models[0];
+                    selectEl.value = keptVal || "";
+                    var selectedOpt = selectEl.options[selectEl.selectedIndex];
+                    if (selectedOpt) selectedOpt.scrollIntoView({ block: 'nearest' });
                 } else {
-                    statusEl.textContent = 'Error: ' + (result.error || 'sin respuesta');
+                    statusEl.textContent = 'Error: ' + (result.error || 'no response');
                     statusEl.style.color = '#dc3545';
                 }
             }).catch(function (err) {
-                statusEl.textContent = 'Error: ' + (err.message || 'red');
+                statusEl.textContent = 'Error: ' + (err.message || 'network');
                 statusEl.style.color = '#dc3545';
             });
-        });
+        }
+
+        document.getElementById('ph-test-copilot-btn').addEventListener('click', populateCopilotModels);
+
+        if (settings.provider === 'copilot') {
+            populateCopilotModels();
+        }
 
         document.getElementById('ph-cancel-btn').addEventListener('click', function () {
             document.getElementById('ph-ai-settings-modal').remove();
         });
 
         document.getElementById('ph-save-btn').addEventListener('click', function () {
+            var copilotSelect = document.getElementById('ph-copilot-model');
+            var copilotModelVal = "";
+            if (copilotSelect) {
+                copilotModelVal = copilotSelect.value || (copilotSelect.selectedOptions && copilotSelect.selectedOptions[0] ? copilotSelect.selectedOptions[0].value : "");
+            }
             const newSettings = {
                 provider: document.getElementById('ph-provider').value,
                 apiKey: document.getElementById('ph-api-key').value,
                 modelName: document.getElementById('ph-model-name').value,
                 openRouterModel: document.getElementById('ph-or-model-name').value,
                 copilotBaseUrl: document.getElementById('ph-copilot-base-url').value.trim() || DEFAULTS.copilotBaseUrl,
-                copilotModel: document.getElementById('ph-copilot-model').value || DEFAULTS.copilotModel,
+                copilotModel: copilotModelVal || DEFAULTS.copilotModel,
                 thinkingBudget: parseInt(document.getElementById('ph-thinking-budget').value, 10) || 4096
             };
             saveSettings(newSettings);
             document.getElementById('ph-ai-settings-modal').remove();
+            createOrUpdateIndicator();
 
-            // Show a non-blocking toast notification
             const toast = document.createElement('div');
-            toast.textContent = '✅ Settings saved!';
+            toast.textContent = 'Settings saved. Changes apply immediately (no reload needed).';
             Object.assign(toast.style, {
                 position: 'fixed', bottom: '30px', left: '50%', transform: 'translateX(-50%)',
                 background: '#2ecc40', color: '#fff', padding: '12px 24px', borderRadius: '8px',
@@ -299,6 +540,7 @@
 
     GM_registerMenuCommand("Open AI Settings", createSettingsModal);
 
+    ensureIndicator();
 
     // === INTERCEPTION LOGIC ===
     // When using GM_ functions, we must use unsafeWindow to access the page's fetch
@@ -347,122 +589,101 @@
                 let responseText = "";
 
                 if (settings.provider === 'google') {
-                    // === GOOGLE AI STUDIO ===
-                    const googleUrl = `https://generativelanguage.googleapis.com/v1beta/models/${settings.modelName}:generateContent?key=${settings.apiKey}`;
-
-                    const genConfig = {
-                        temperature: 0.7,
-                        thinkingConfig: {
-                            include_thoughts: true,
-                            thinking_budget: settings.thinkingBudget
+                    responseText = await withRetry(async function () {
+                        const googleUrl = `https://generativelanguage.googleapis.com/v1beta/models/${settings.modelName}:generateContent?key=${settings.apiKey}`;
+                        const genConfig = {
+                            temperature: 0.7,
+                            thinkingConfig: {
+                                include_thoughts: true,
+                                thinking_budget: settings.thinkingBudget
+                            }
+                        };
+                        if (isAdvisor) {
+                            genConfig.responseMimeType = "application/json";
+                            genConfig.responseSchema = convertSchemaForGoogle(gameSchema);
+                            console.log("%c[PAX AI] Advisor: using native responseSchema", "color: cyan");
                         }
-                    };
-
-                    // Use native structured output ONLY for advisor (simple schema)
-                    if (isAdvisor) {
-                        genConfig.responseMimeType = "application/json";
-                        genConfig.responseSchema = convertSchemaForGoogle(gameSchema);
-                        console.log("%c[PAX AI] Advisor: using native responseSchema", "color: cyan");
-                    }
-
-                    const googlePayload = {
-                        contents: [{ parts: [{ text: finalPrompt }] }],
-                        generationConfig: genConfig
-                    };
-
-                    // Use GM_xmlhttpRequest or originalFetch? 
-                    // Since we are in the page context via unsafeWindow, we can use originalFetch (which is the page's fetch).
-                    // However, for cross-origin requests (like to Google API), the page's CSP might block it if we use the page's fetch.
-                    // But the original script used window.fetch and it worked, implying CSP allows it or it wasn't blocked.
-                    // To be safe and avoid CORS/CSP issues, usually GM_xmlhttpRequest is better, but let's stick to originalFetch for now 
-                    // as it mimics the previous behavior, just executed from the right context.
-                    // Actually, if we use originalFetch, we are subject to the page's CSP. 
-                    // If the previous script worked with `grant none`, it means the page's CSP allowed it OR the browser extension bypassed it.
-                    // Let's try using originalFetch first.
-
-                    const myResponse = await originalFetch(googleUrl, {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify(googlePayload)
+                        const googlePayload = {
+                            contents: [{ parts: [{ text: finalPrompt }] }],
+                            generationConfig: genConfig
+                        };
+                        const myResponse = await originalFetch(googleUrl, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify(googlePayload)
+                        });
+                        if (!myResponse.ok) {
+                            const errText = await myResponse.text();
+                            const err = new Error("Google API Error: " + errText);
+                            err.status = myResponse.status;
+                            throw err;
+                        }
+                        const myJson = await myResponse.json();
+                        const parts = myJson.candidates?.[0]?.content?.parts || [];
+                        for (let i = parts.length - 1; i >= 0; i--) {
+                            if (parts[i].text) return parts[i].text;
+                        }
+                        return "";
                     });
-
-                    if (!myResponse.ok) {
-                        const errText = await myResponse.text();
-                        console.error("[PAX AI] Google API Error:", errText);
-                        throw new Error("Google API Error: " + errText);
-                    }
-
-                    const myJson = await myResponse.json();
-                    const parts = myJson.candidates?.[0]?.content?.parts || [];
-
-                    // Find the last text part (the actual response, skipping thoughts)
-                    for (let i = parts.length - 1; i >= 0; i--) {
-                        if (parts[i].text) {
-                            responseText = parts[i].text;
-                            break;
-                        }
-                    }
 
                 } else if (settings.provider === 'openrouter') {
-                    // === OPENROUTER ===
-                    const orUrl = "https://openrouter.ai/api/v1/chat/completions";
-
-                    const orPayload = {
-                        model: settings.openRouterModel,
-                        messages: [
-                            { role: "user", content: finalPrompt }
-                        ]
-                    };
-
-                    // Use native structured output ONLY for advisor
-                    if (isAdvisor) {
-                        orPayload.response_format = {
-                            type: "json_schema",
-                            json_schema: gameSchema
+                    responseText = await withRetry(async function () {
+                        const orUrl = "https://openrouter.ai/api/v1/chat/completions";
+                        const orPayload = {
+                            model: settings.openRouterModel,
+                            messages: [{ role: "user", content: finalPrompt }]
                         };
-                        console.log("%c[PAX AI] Advisor: using response_format", "color: cyan");
-                    }
-
-                    const myResponse = await originalFetch(orUrl, {
-                        method: "POST",
-                        headers: {
-                            "Content-Type": "application/json",
-                            "Authorization": `Bearer ${settings.apiKey}`,
-                            "HTTP-Referer": window.location.href,
-                            "X-Title": "Pax Historia Hook"
-                        },
-                        body: JSON.stringify(orPayload)
+                        if (isAdvisor) {
+                            orPayload.response_format = {
+                                type: "json_schema",
+                                json_schema: gameSchema
+                            };
+                            console.log("%c[PAX AI] Advisor: using response_format", "color: cyan");
+                        }
+                        const myResponse = await originalFetch(orUrl, {
+                            method: "POST",
+                            headers: {
+                                "Content-Type": "application/json",
+                                "Authorization": `Bearer ${settings.apiKey}`,
+                                "HTTP-Referer": window.location.href,
+                                "X-Title": "Pax Historia Hook"
+                            },
+                            body: JSON.stringify(orPayload)
+                        });
+                        if (!myResponse.ok) {
+                            const errText = await myResponse.text();
+                            const err = new Error("OpenRouter API Error: " + errText);
+                            err.status = myResponse.status;
+                            throw err;
+                        }
+                        const myJson = await myResponse.json();
+                        return myJson.choices?.[0]?.message?.content || "";
                     });
-
-                    if (!myResponse.ok) {
-                        const errText = await myResponse.text();
-                        console.error("[PAX AI] OpenRouter API Error:", errText);
-                        throw new Error("OpenRouter API Error: " + errText);
-                    }
-
-                    const myJson = await myResponse.json();
-                    responseText = myJson.choices?.[0]?.message?.content || "";
                 } else if (settings.provider === 'copilot') {
-                    // === COPILOT API (OpenAI-compatible, no API key) ===
-                    const baseUrl = (settings.copilotBaseUrl || DEFAULTS.copilotBaseUrl).replace(/\/$/, "");
-                    const copilotPayload = {
-                        model: settings.copilotModel || DEFAULTS.copilotModel,
-                        messages: [{ role: "user", content: finalPrompt }]
-                    };
-
-                    const copilotResult = await fetchCopilotApi("/v1/chat/completions", {
-                        baseUrl: baseUrl,
-                        method: "POST",
-                        body: copilotPayload
+                    responseText = await withRetry(async function () {
+                        const baseUrl = (settings.copilotBaseUrl || DEFAULTS.copilotBaseUrl).replace(/\/$/, "");
+                        const copilotPayload = {
+                            model: settings.copilotModel || DEFAULTS.copilotModel,
+                            messages: [{ role: "user", content: finalPrompt }]
+                        };
+                        try {
+                            var copilotResult = await fetchCopilotApi("/v1/chat/completions", {
+                                baseUrl: baseUrl,
+                                method: "POST",
+                                body: copilotPayload
+                            });
+                        } catch (e) {
+                            e.status = 0;
+                            throw e;
+                        }
+                        if (!copilotResult.ok) {
+                            const errMsg = copilotResult.data?.error?.message || copilotResult.text || "HTTP " + copilotResult.status;
+                            const err = new Error("Copilot API Error: " + errMsg);
+                            err.status = copilotResult.status;
+                            throw err;
+                        }
+                        return copilotResult.data?.choices?.[0]?.message?.content || "";
                     });
-
-                    if (!copilotResult.ok) {
-                        const errMsg = copilotResult.data?.error?.message || copilotResult.text || "HTTP " + copilotResult.status;
-                        console.error("[PAX AI] Copilot API Error:", errMsg);
-                        throw new Error("Copilot API Error: " + errMsg);
-                    }
-
-                    responseText = copilotResult.data?.choices?.[0]?.message?.content || "";
                 }
 
                 // === CLEANUP & SURGERY ===
