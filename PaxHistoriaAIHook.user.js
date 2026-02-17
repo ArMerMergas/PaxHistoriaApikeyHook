@@ -37,13 +37,19 @@
             if (obj.type.includes('null')) obj.nullable = true;
             obj.type = nonNull[0] || 'string';
         }
-        // Remove unsupported fields
+        // Remove fields unsupported by Google's responseSchema
         delete obj.additionalProperties;
+        delete obj.minItems;
 
+        // Recurse into ALL possible schema locations
         if (obj.properties) Object.values(obj.properties).forEach(fixTypeArrays);
         if (obj.items) fixTypeArrays(obj.items);
+        if (obj.anyOf) obj.anyOf.forEach(fixTypeArrays);
+        if (obj.oneOf) obj.oneOf.forEach(fixTypeArrays);
+        if (obj.allOf) obj.allOf.forEach(fixTypeArrays);
         return obj;
     }
+
 
     // === DEFAULT SETTINGS ===
     const DEFAULTS = {
@@ -322,8 +328,13 @@
                 console.log(`%c[PAX AI] TYPE: ${isAction ? "ACTION (RAW JSON)" : "CHAT (WRAPPER)"} | Provider: ${settings.provider}`, "background: blue; color: white; padding: 5px; font-weight: bold;");
 
                 let finalPrompt = userPrompt;
-                // Schema is now passed via native API params (responseSchema / response_format),
-                // NOT injected into prompt text — that caused garbled output.
+                // Advisor uses native responseSchema (clean JSON output).
+                // Everything else uses old prompt-based schema injection (complex schemas break Google's API).
+                const isAdvisor = isAction && gameSchema && gameSchema.name === 'advisorResponse';
+
+                if (isAction && gameSchema && !isAdvisor) {
+                    finalPrompt += `\n\nTASK: Generate a valid JSON object matching this schema.\nSCHEMA: ${JSON.stringify(gameSchema)}\n\nIMPORTANT: Return ONLY the JSON object. No markdown.`;
+                }
 
                 let responseText = "";
 
@@ -339,11 +350,11 @@
                         }
                     };
 
-                    // Use native structured output for ACTION requests
-                    if (isAction && gameSchema) {
+                    // Use native structured output ONLY for advisor (simple schema)
+                    if (isAdvisor) {
                         genConfig.responseMimeType = "application/json";
                         genConfig.responseSchema = convertSchemaForGoogle(gameSchema);
-                        console.log("%c[PAX AI] Using native responseSchema for structured output", "color: cyan");
+                        console.log("%c[PAX AI] Advisor: using native responseSchema", "color: cyan");
                     }
 
                     const googlePayload = {
@@ -395,13 +406,13 @@
                         ]
                     };
 
-                    // Use native structured output for ACTION requests
-                    if (isAction && gameSchema) {
+                    // Use native structured output ONLY for advisor
+                    if (isAdvisor) {
                         orPayload.response_format = {
                             type: "json_schema",
                             json_schema: gameSchema
                         };
-                        console.log("%c[PAX AI] Using response_format for structured output", "color: cyan");
+                        console.log("%c[PAX AI] Advisor: using response_format", "color: cyan");
                     }
 
                     const myResponse = await originalFetch(orUrl, {
