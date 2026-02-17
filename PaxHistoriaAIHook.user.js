@@ -120,53 +120,61 @@
         const settings = loadSettings();
 
         const modalHTML = `
-            <div id="ph-ai-settings-modal" style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); z-index: 10000; display: flex; justify-content: center; align-items: center; font-family: sans-serif;">
-                <div style="background: #222; color: #fff; padding: 20px; border-radius: 8px; width: 420px; box-shadow: 0 4px 10px rgba(0,0,0,0.5);">
-                    <h2 style="margin-top: 0; border-bottom: 1px solid #444; padding-bottom: 10px;">AI Settings</h2>
+            <style id="ph-ai-modal-styles">
+                #ph-ai-settings-modal { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 10000; display: flex; justify-content: center; align-items: center; padding: 12px; box-sizing: border-box; overflow-y: auto; font-family: system-ui, -apple-system, sans-serif; }
+                #ph-ai-modal-box { background: #222; color: #fff; padding: 16px; border-radius: 8px; width: 100%; max-width: 420px; max-height: calc(100vh - 24px); overflow-y: auto; box-shadow: 0 4px 20px rgba(0,0,0,0.5); box-sizing: border-box; }
+                #ph-ai-modal-box h2 { margin: 0 0 12px; font-size: 1.1rem; border-bottom: 1px solid #444; padding-bottom: 8px; }
+                #ph-ai-modal-box label { display: block; margin-top: 10px; font-size: 0.9rem; }
+                #ph-ai-modal-box input, #ph-ai-modal-box select { width: 100%; padding: 8px; margin-top: 4px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px; box-sizing: border-box; font-size: 0.9rem; }
+                #ph-ai-modal-box select[multiple] { min-height: 120px; max-height: 40vh; }
+                #ph-ai-modal-box button { padding: 8px 14px; font-size: 0.9rem; border: none; border-radius: 4px; cursor: pointer; }
+                #ph-ai-modal-buttons { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+                @media (max-width: 380px) { #ph-ai-modal-box { padding: 12px; } #ph-ai-modal-buttons { flex-direction: column; } #ph-ai-modal-buttons button { width: 100%; } }
+            </style>
+            <div id="ph-ai-settings-modal">
+                <div id="ph-ai-modal-box">
+                    <h2>AI Settings</h2>
                     
-                    <label style="display: block; margin-top: 10px;">Provider:</label>
-                    <select id="ph-provider" style="width: 100%; padding: 8px; margin-top: 5px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px;">
+                    <label for="ph-provider">Provider:</label>
+                    <select id="ph-provider">
                         <option value="google" ${settings.provider === 'google' ? 'selected' : ''}>Google AI Studio</option>
                         <option value="openrouter" ${settings.provider === 'openrouter' ? 'selected' : ''}>OpenRouter</option>
                         <option value="copilot" ${settings.provider === 'copilot' ? 'selected' : ''}>Copilot API (local)</option>
                     </select>
 
                     <div id="ph-api-key-container" style="display: ${settings.provider === 'copilot' ? 'none' : 'block'};">
-                        <label style="display: block; margin-top: 10px;">API Key:</label>
-                        <input type="text" id="ph-api-key" value="${settings.apiKey}" style="width: 100%; padding: 8px; margin-top: 5px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px;" placeholder="Enter API Key">
+                        <label for="ph-api-key">API Key:</label>
+                        <input type="text" id="ph-api-key" value="${settings.apiKey}" placeholder="Enter API Key">
                     </div>
 
                     <div id="ph-google-fields" style="display: ${settings.provider === 'google' ? 'block' : 'none'};">
-                        <label style="display: block; margin-top: 10px;">Model Name:</label>
-                        <input type="text" id="ph-model-name" value="${settings.modelName}" style="width: 100%; padding: 8px; margin-top: 5px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px;">
-                        
-                        <label style="display: block; margin-top: 10px;">Thinking Budget (Tokens):</label>
-                        <input type="number" id="ph-thinking-budget" value="${settings.thinkingBudget}" style="width: 100%; padding: 8px; margin-top: 5px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px;">
+                        <label for="ph-model-name">Model Name:</label>
+                        <input type="text" id="ph-model-name" value="${settings.modelName}">
+                        <label for="ph-thinking-budget">Thinking Budget (Tokens):</label>
+                        <input type="number" id="ph-thinking-budget" value="${settings.thinkingBudget}">
                     </div>
 
                     <div id="ph-openrouter-fields" style="display: ${settings.provider === 'openrouter' ? 'block' : 'none'};">
-                        <label style="display: block; margin-top: 10px;">OpenRouter Model:</label>
-                        <input type="text" id="ph-or-model-name" value="${settings.openRouterModel}" style="width: 100%; padding: 8px; margin-top: 5px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px;">
+                        <label for="ph-or-model-name">OpenRouter Model:</label>
+                        <input type="text" id="ph-or-model-name" value="${settings.openRouterModel}">
                     </div>
 
                     <div id="ph-copilot-fields" style="display: ${settings.provider === 'copilot' ? 'block' : 'none'};">
-                        <label style="display: block; margin-top: 10px;">Base URL (sin API key):</label>
-                        <input type="text" id="ph-copilot-base-url" value="${settings.copilotBaseUrl}" style="width: 100%; padding: 8px; margin-top: 5px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px;" placeholder="http://localhost:4141">
-                        <div style="margin-top: 10px;">
-                            <label style="display: block; margin-bottom: 5px;">Model:</label>
-                            <select id="ph-copilot-model" size="12" style="width: 100%; padding: 8px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px;">
-                                <option value="${settings.copilotModel}">${settings.copilotModel}</option>
-                            </select>
-                        </div>
-                        <div style="margin-top: 10px; display: flex; align-items: center; gap: 8px;">
-                            <button id="ph-test-copilot-btn" style="padding: 6px 12px; background: #28a745; color: #fff; border: none; border-radius: 4px; cursor: pointer;">Test conexion</button>
-                            <span id="ph-test-status" style="font-size: 12px;"></span>
+                        <label for="ph-copilot-base-url">Base URL (sin API key):</label>
+                        <input type="text" id="ph-copilot-base-url" value="${settings.copilotBaseUrl}" placeholder="http://localhost:4141">
+                        <label for="ph-copilot-model">Model:</label>
+                        <select id="ph-copilot-model" size="8">
+                            <option value="${settings.copilotModel}">${settings.copilotModel}</option>
+                        </select>
+                        <div style="margin-top: 10px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px;">
+                            <button id="ph-test-copilot-btn" style="background: #28a745; color: #fff;">Test conexion</button>
+                            <span id="ph-test-status" style="font-size: 0.85rem;"></span>
                         </div>
                     </div>
 
-                    <div style="margin-top: 20px; text-align: right;">
-                        <button id="ph-cancel-btn" style="padding: 8px 16px; background: #555; color: #fff; border: none; border-radius: 4px; cursor: pointer; margin-right: 10px;">Cancel</button>
-                        <button id="ph-save-btn" style="padding: 8px 16px; background: #007bff; color: #fff; border: none; border-radius: 4px; cursor: pointer;">Save</button>
+                    <div id="ph-ai-modal-buttons">
+                        <button id="ph-cancel-btn" style="background: #555; color: #fff;">Cancel</button>
+                        <button id="ph-save-btn" style="background: #007bff; color: #fff;">Save</button>
                     </div>
                 </div>
             </div>
