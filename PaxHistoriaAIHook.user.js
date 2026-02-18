@@ -39,9 +39,43 @@
             if (obj.type.includes('null')) obj.nullable = true;
             obj.type = nonNull[0] || 'string';
         }
+
         // Remove fields unsupported by Google's responseSchema
         delete obj.additionalProperties;
         delete obj.minItems;
+        delete obj.title;  // Google doesn't support title in sub-schemas
+
+        // Handle anyOf/oneOf: filter out empty-object null-placeholders
+        // Google rejects type:"object" with empty properties
+        ['anyOf', 'oneOf'].forEach(function (key) {
+            if (!Array.isArray(obj[key])) return;
+            obj[key] = obj[key].filter(function (entry) {
+                if (entry && entry.type === 'object' &&
+                    (!entry.properties || Object.keys(entry.properties).length === 0)) {
+                    obj.nullable = true;
+                    return false; // drop this null-placeholder
+                }
+                return true;
+            });
+            // Unwrap single-entry anyOf/oneOf
+            if (obj[key].length === 1) {
+                var inner = obj[key][0];
+                delete obj[key];
+                // Merge inner into obj, preserving nullable
+                var wasNullable = obj.nullable;
+                Object.assign(obj, inner);
+                if (wasNullable) obj.nullable = true;
+            } else if (obj[key].length === 0) {
+                delete obj[key];
+                if (!obj.type) obj.type = 'string';
+            }
+        });
+
+        // Standalone object with no/empty properties → add placeholder
+        if (obj.type === 'object' && (!obj.properties || Object.keys(obj.properties).length === 0)
+            && !obj.anyOf && !obj.oneOf) {
+            obj.properties = { "_placeholder": { type: "string", description: "unused" } };
+        }
 
         // Recurse into ALL possible schema locations
         if (obj.properties) Object.values(obj.properties).forEach(fixTypeArrays);
@@ -443,18 +477,18 @@
         return base.endsWith("/v1") ? base : base + "/v1";
     }
 
-    function callAnthropicApi(settings, finalPrompt, isAdvisor, gameSchema) {
+    function callAnthropicApi(settings, finalPrompt, useStructuredOutput, gameSchema) {
         var url = PROVIDER_URLS.anthropic + "/messages";
         var body = {
             model: settings.anthropicModel || DEFAULTS.anthropicModel,
             max_tokens: 4096,
             messages: [{ role: "user", content: finalPrompt }]
         };
-        if (isAdvisor && gameSchema && gameSchema.schema) {
+        if (useStructuredOutput && gameSchema && gameSchema.schema) {
             body.output_config = {
                 format: { type: "json_schema", schema: gameSchema.schema }
             };
-            console.log("%c[PAX AI] Advisor: using Anthropic output_config", "color: cyan");
+            console.log("%c[PAX AI] Using Anthropic output_config for: " + (gameSchema.name || "unknown"), "color: cyan");
         }
         var headers = {
             "Content-Type": "application/json",
@@ -553,7 +587,7 @@
                         <option value="generic" ${settings.provider === 'generic' ? 'selected' : ''}>Generic (URL)</option>
                     </select>
 
-                    <div id="ph-api-key-container" style="display: ${['ollama','lmstudio','copilot','generic'].indexOf(settings.provider) !== -1 ? 'none' : 'block'};">
+                    <div id="ph-api-key-container" style="display: ${['ollama', 'lmstudio', 'copilot', 'generic'].indexOf(settings.provider) !== -1 ? 'none' : 'block'};">
                         <label for="ph-api-key">API Key:</label>
                         <input type="text" id="ph-api-key" value="${settings.apiKey}" placeholder="sk-...">
                     </div>
@@ -665,7 +699,7 @@
             const provider = document.getElementById('ph-provider').value;
             const noApiKey = ['ollama', 'lmstudio', 'copilot', 'generic'];
             document.getElementById('ph-api-key-container').style.display = noApiKey.indexOf(provider) !== -1 ? 'none' : 'block';
-            ['google','openrouter','openai','groq','ollama','lmstudio','together','fireworks','mistral','anthropic','copilot','generic'].forEach(function (p) {
+            ['google', 'openrouter', 'openai', 'groq', 'ollama', 'lmstudio', 'together', 'fireworks', 'mistral', 'anthropic', 'copilot', 'generic'].forEach(function (p) {
                 var el = document.getElementById('ph-' + p + '-fields');
                 if (el) el.style.display = p === provider ? 'block' : 'none';
             });
@@ -866,13 +900,8 @@
                 console.log(`%c[PAX AI] TYPE: ${isAction ? "ACTION (RAW JSON)" : "CHAT (WRAPPER)"} | Provider: ${settings.provider}`, "background: blue; color: white; padding: 5px; font-weight: bold;");
 
                 let finalPrompt = userPrompt;
-                // Advisor uses native responseSchema (clean JSON output).
-                // Everything else uses old prompt-based schema injection (complex schemas break Google's API).
-                const isAdvisor = isAction && gameSchema && gameSchema.name === 'advisorResponse';
-
-                if (isAction && gameSchema && !isAdvisor) {
-                    finalPrompt += `\n\nTASK: Generate a valid JSON object matching this schema.\nSCHEMA: ${JSON.stringify(gameSchema)}\n\nIMPORTANT: Return ONLY the JSON object. No markdown.`;
-                }
+                // Native structured output for ALL action types (prompt-based schema injection
+                // causes AI to dump schema text and ignore player's request)
 
                 let responseText = "";
 
@@ -886,10 +915,10 @@
                                 thinking_budget: settings.thinkingBudget
                             }
                         };
-                        if (isAdvisor) {
+                        if (isAction && gameSchema) {
                             genConfig.responseMimeType = "application/json";
                             genConfig.responseSchema = convertSchemaForGoogle(gameSchema);
-                            console.log("%c[PAX AI] Advisor: using native responseSchema", "color: cyan");
+                            console.log("%c[PAX AI] Using native responseSchema for: " + (gameSchema.name || "unknown"), "color: cyan");
                         }
                         const googlePayload = {
                             contents: [{ parts: [{ text: finalPrompt }] }],
@@ -916,7 +945,7 @@
 
                 } else if (settings.provider === 'anthropic') {
                     responseText = await withRetry(async function () {
-                        return callAnthropicApi(settings, finalPrompt, isAdvisor, gameSchema);
+                        return callAnthropicApi(settings, finalPrompt, isAction && !!gameSchema, gameSchema);
                     });
                 } else {
                     responseText = await withRetry(async function () {
@@ -982,9 +1011,9 @@
                             model: modelId,
                             messages: [{ role: "user", content: finalPrompt }]
                         };
-                        if (isAdvisor && gameSchema) {
+                        if (isAction && gameSchema) {
                             payload.response_format = { type: "json_schema", json_schema: gameSchema };
-                            console.log("%c[PAX AI] Advisor: using response_format", "color: cyan");
+                            console.log("%c[PAX AI] Using response_format for: " + (gameSchema.name || "unknown"), "color: cyan");
                         }
                         var headers = { "Content-Type": "application/json" };
                         if (authKey) headers["Authorization"] = "Bearer " + authKey;
