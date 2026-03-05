@@ -40,11 +40,6 @@
             obj.type = nonNull[0] || 'string';
         }
 
-        // Remove fields unsupported by Google's responseSchema
-        delete obj.additionalProperties;
-        delete obj.minItems;
-        delete obj.title;  // Google doesn't support title in sub-schemas
-
         // Handle anyOf/oneOf: filter out empty-object null-placeholders
         // Google rejects type:"object" with empty properties
         ['anyOf', 'oneOf'].forEach(function (key) {
@@ -53,15 +48,13 @@
                 if (entry && entry.type === 'object' &&
                     (!entry.properties || Object.keys(entry.properties).length === 0)) {
                     obj.nullable = true;
-                    return false; // drop this null-placeholder
+                    return false;
                 }
                 return true;
             });
-            // Unwrap single-entry anyOf/oneOf
             if (obj[key].length === 1) {
                 var inner = obj[key][0];
                 delete obj[key];
-                // Merge inner into obj, preserving nullable
                 var wasNullable = obj.nullable;
                 Object.assign(obj, inner);
                 if (wasNullable) obj.nullable = true;
@@ -70,6 +63,11 @@
                 if (!obj.type) obj.type = 'string';
             }
         });
+
+        // удаляем ПОСЛЕ anyOf-развёртки, иначе Object.assign тащит их обратно
+        delete obj.additionalProperties;
+        delete obj.minItems;
+        delete obj.title;
 
         // Standalone object with no/empty properties → add placeholder
         if (obj.type === 'object' && (!obj.properties || Object.keys(obj.properties).length === 0)
@@ -85,6 +83,7 @@
         if (obj.allOf) obj.allOf.forEach(fixTypeArrays);
         return obj;
     }
+
 
 
     // === PROVIDER URLS (documented endpoints) ===
