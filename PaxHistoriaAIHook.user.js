@@ -935,7 +935,7 @@
                 let responseText = "";
 
                 if (settings.provider === 'google') {
-                    responseText = await withRetry(async function () {
+                    responseText = await (async function () {
                         const googleUrl = `https://generativelanguage.googleapis.com/v1beta/models/${settings.modelName}:generateContent?key=${settings.apiKey}`;
 
                         async function doGoogleRequest(useNativeSchema) {
@@ -987,14 +987,14 @@
                             if (parts[i].text) return parts[i].text;
                         }
                         return "";
-                    });
+                    })();
 
                 } else if (settings.provider === 'anthropic') {
-                    responseText = await withRetry(async function () {
+                    responseText = await (async function () {
                         return callAnthropicApi(settings, finalPrompt, isAction && !!gameSchema, gameSchema);
-                    });
+                    })();
                 } else {
-                    responseText = await withRetry(async function () {
+                    responseText = await (async function () {
                         var chatBaseUrl, modelId, authKey, extraHeaders = {};
                         switch (settings.provider) {
                             case 'openrouter':
@@ -1098,7 +1098,7 @@
                         }
 
                         return choiceMsg ? (choiceMsg.content || "") : "";
-                    });
+                    })();
                 }
 
                 // === CLEANUP & SURGERY ===
