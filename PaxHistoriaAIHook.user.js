@@ -1068,7 +1068,7 @@
                         if (isAction && gameSchema) {
                             if (settings.provider === 'deepseek') {
                                 payload.response_format = { type: "json_object" };
-                                payload.max_tokens = 8192;
+                                payload.max_tokens = 66666;
                                 payload.messages[0].content += "\n\nPlease output the result in json format. Your response must be a valid json object matching this JSON Schema:\n" + JSON.stringify(gameSchema) + "\n\nDo not include any other text or markdown.";
                                 console.log("%c[PAX AI] Using json_object format for DeepSeek: " + (gameSchema.name || "unknown"), "color: cyan");
                             } else {
@@ -1128,7 +1128,7 @@
                                 cleanText = cleanText + appendOptions[i];
                                 console.warn("[PAX AI] Auto-repaired truncated JSON by appending: " + appendOptions[i]);
                                 break;
-                            } catch(err) {}
+                            } catch (err) { }
                         }
                         if (!parsed) {
                             console.error("[PAX AI] INVALID JSON (Unrepairable):", cleanText);
