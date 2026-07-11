@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Pax Historia: Custom AI Backend (Multi-Provider)
 // @namespace    http://tampermonkey.net/
-// @version      15.0
-// @description  Custom AI backend for Pax Historia. Supports Google, OpenRouter, OpenAI, Groq, Ollama, LM Studio, Together, Fireworks, Mistral, Anthropic, Copilot, Generic.
+// @version      15.1
+// @description  Custom AI backend for Pax Historia. Supports Google, OpenRouter, OpenAI, Groq, Ollama, LM Studio, Together, Fireworks, Mistral, Anthropic, Copilot, Generic, DeepSeek.
 // @author       You
 // @match        https://paxhistoria.co/*
 // @match        https://www.paxhistoria.co/*
@@ -96,7 +96,8 @@
         together: "https://api.together.xyz/v1",
         fireworks: "https://api.fireworks.ai/inference/v1",
         mistral: "https://api.mistral.ai/v1",
-        anthropic: "https://api.anthropic.com/v1"
+        anthropic: "https://api.anthropic.com/v1",
+        deepseek: "https://api.deepseek.com/v1"
     };
 
     // === DEFAULT SETTINGS ===
@@ -115,6 +116,7 @@
         fireworksModel: "accounts/fireworks/models/llama-v3p1-8b-instruct",
         mistralModel: "mistral-small-latest",
         anthropicModel: "claude-sonnet-4-20250514",
+        deepseekModel: "deepseek-chat",
         copilotBaseUrl: "http://localhost:4141",
         copilotModel: "gpt-4.1",
         genericBaseUrl: "https://api.openai.com/v1",
@@ -140,6 +142,7 @@
             fireworksModel: GM_getValue("fireworksModel", DEFAULTS.fireworksModel),
             mistralModel: GM_getValue("mistralModel", DEFAULTS.mistralModel),
             anthropicModel: GM_getValue("anthropicModel", DEFAULTS.anthropicModel),
+            deepseekModel: GM_getValue("deepseekModel", DEFAULTS.deepseekModel),
             copilotBaseUrl: GM_getValue("copilotBaseUrl", DEFAULTS.copilotBaseUrl),
             copilotModel: GM_getValue("copilotModel", DEFAULTS.copilotModel),
             genericBaseUrl: GM_getValue("genericBaseUrl", DEFAULTS.genericBaseUrl),
@@ -164,6 +167,7 @@
         GM_setValue("fireworksModel", settings.fireworksModel);
         GM_setValue("mistralModel", settings.mistralModel);
         GM_setValue("anthropicModel", settings.anthropicModel);
+        GM_setValue("deepseekModel", settings.deepseekModel);
         GM_setValue("copilotBaseUrl", settings.copilotBaseUrl);
         GM_setValue("copilotModel", settings.copilotModel);
         GM_setValue("genericBaseUrl", settings.genericBaseUrl);
@@ -261,6 +265,7 @@
             case "fireworks": return (settings.fireworksModel || "").split("/").pop() || "?";
             case "mistral": return settings.mistralModel;
             case "anthropic": return settings.anthropicModel;
+            case "deepseek": return settings.deepseekModel;
             case "generic": return settings.genericModel || (settings.genericBaseUrl || "").replace(/\/$/, "").split("/").pop() || "?";
             default: return "?";
         }
@@ -582,6 +587,7 @@
                         <option value="fireworks" ${settings.provider === 'fireworks' ? 'selected' : ''}>Fireworks AI</option>
                         <option value="mistral" ${settings.provider === 'mistral' ? 'selected' : ''}>Mistral AI</option>
                         <option value="anthropic" ${settings.provider === 'anthropic' ? 'selected' : ''}>Anthropic (Claude)</option>
+                        <option value="deepseek" ${settings.provider === 'deepseek' ? 'selected' : ''}>DeepSeek</option>
                         <option value="copilot" ${settings.provider === 'copilot' ? 'selected' : ''}>Copilot API (local)</option>
                         <option value="generic" ${settings.provider === 'generic' ? 'selected' : ''}>Generic (URL)</option>
                     </select>
@@ -657,6 +663,11 @@
                         <input type="text" id="ph-anthropic-model" value="${settings.anthropicModel}" placeholder="claude-sonnet-4-20250514">
                     </div>
 
+                    <div id="ph-deepseek-fields" style="display: ${settings.provider === 'deepseek' ? 'block' : 'none'};">
+                        <label for="ph-deepseek-model">Model:</label>
+                        <input type="text" id="ph-deepseek-model" value="${settings.deepseekModel}" placeholder="deepseek-chat">
+                    </div>
+
                     <div id="ph-copilot-fields" style="display: ${settings.provider === 'copilot' ? 'block' : 'none'};">
                         <label for="ph-copilot-base-url">Base URL:</label>
                         <input type="text" id="ph-copilot-base-url" value="${settings.copilotBaseUrl}" placeholder="http://localhost:4141">
@@ -698,7 +709,7 @@
             const provider = document.getElementById('ph-provider').value;
             const noApiKey = ['ollama', 'lmstudio', 'copilot', 'generic'];
             document.getElementById('ph-api-key-container').style.display = noApiKey.indexOf(provider) !== -1 ? 'none' : 'block';
-            ['google', 'openrouter', 'openai', 'groq', 'ollama', 'lmstudio', 'together', 'fireworks', 'mistral', 'anthropic', 'copilot', 'generic'].forEach(function (p) {
+            ['google', 'openrouter', 'openai', 'groq', 'ollama', 'lmstudio', 'together', 'fireworks', 'mistral', 'anthropic', 'deepseek', 'copilot', 'generic'].forEach(function (p) {
                 var el = document.getElementById('ph-' + p + '-fields');
                 if (el) el.style.display = p === provider ? 'block' : 'none';
             });
@@ -830,6 +841,7 @@
                 fireworksModel: getVal('ph-fireworks-model', DEFAULTS.fireworksModel),
                 mistralModel: getVal('ph-mistral-model', DEFAULTS.mistralModel),
                 anthropicModel: getVal('ph-anthropic-model', DEFAULTS.anthropicModel),
+                deepseekModel: getVal('ph-deepseek-model', DEFAULTS.deepseekModel),
                 copilotBaseUrl: getVal('ph-copilot-base-url', DEFAULTS.copilotBaseUrl),
                 copilotModel: getSelectVal('ph-copilot-model', DEFAULTS.copilotModel),
                 genericBaseUrl: getVal('ph-generic-base-url', DEFAULTS.genericBaseUrl),
@@ -990,6 +1002,11 @@
                             case 'mistral':
                                 chatBaseUrl = PROVIDER_URLS.mistral;
                                 modelId = settings.mistralModel;
+                                authKey = settings.apiKey;
+                                break;
+                            case 'deepseek':
+                                chatBaseUrl = PROVIDER_URLS.deepseek;
+                                modelId = settings.deepseekModel;
                                 authKey = settings.apiKey;
                                 break;
                             case 'copilot':
