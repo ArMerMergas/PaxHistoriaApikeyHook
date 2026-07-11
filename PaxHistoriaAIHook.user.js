@@ -1028,8 +1028,15 @@
                             messages: [{ role: "user", content: finalPrompt }]
                         };
                         if (isAction && gameSchema) {
-                            payload.response_format = { type: "json_schema", json_schema: gameSchema };
-                            console.log("%c[PAX AI] Using response_format for: " + (gameSchema.name || "unknown"), "color: cyan");
+                            if (settings.provider === 'deepseek') {
+                                payload.response_format = { type: "json_object" };
+                                payload.max_tokens = 8192;
+                                payload.messages[0].content += "\n\nPlease output the result in json format. Your response must be a valid json object matching this JSON Schema:\n" + JSON.stringify(gameSchema) + "\n\nDo not include any other text or markdown.";
+                                console.log("%c[PAX AI] Using json_object format for DeepSeek: " + (gameSchema.name || "unknown"), "color: cyan");
+                            } else {
+                                payload.response_format = { type: "json_schema", json_schema: gameSchema };
+                                console.log("%c[PAX AI] Using response_format for: " + (gameSchema.name || "unknown"), "color: cyan");
+                            }
                         }
                         var headers = { "Content-Type": "application/json" };
                         if (authKey) headers["Authorization"] = "Bearer " + authKey;
