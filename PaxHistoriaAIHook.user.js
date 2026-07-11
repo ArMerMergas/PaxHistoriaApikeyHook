@@ -231,7 +231,6 @@
                 url: url,
                 headers: headers,
                 data: body,
-                timeout: 60000,
                 onload: function (response) {
                     console.log(`%c[PAX AI Network] Response received from ${url} | Status: ${response.status}`, "color: " + (response.status >= 200 && response.status < 300 ? "lime" : "red"));
                     if (response.status >= 400) {
