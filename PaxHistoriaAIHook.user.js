@@ -67,7 +67,9 @@
         // удаляем ПОСЛЕ anyOf-развёртки, иначе Object.assign тащит их обратно
         delete obj.additionalProperties;
         delete obj.minItems;
+        delete obj.maxItems;
         delete obj.title;
+        delete obj.propertyOrdering;
 
         // Standalone object with no/empty properties → add placeholder
         if (obj.type === 'object' && (!obj.properties || Object.keys(obj.properties).length === 0)
@@ -97,7 +99,7 @@
         fireworks: "https://api.fireworks.ai/inference/v1",
         mistral: "https://api.mistral.ai/v1",
         anthropic: "https://api.anthropic.com/v1",
-        deepseek: "https://api.deepseek.com/v1"
+        deepseek: "https://api.deepseek.com"
     };
 
     // === DEFAULT SETTINGS ===
@@ -116,7 +118,7 @@
         fireworksModel: "accounts/fireworks/models/llama-v3p1-8b-instruct",
         mistralModel: "mistral-small-latest",
         anthropicModel: "claude-sonnet-4-20250514",
-        deepseekModel: "deepseek-chat",
+        deepseekModel: "deepseek-v4-pro",
         copilotBaseUrl: "http://localhost:4141",
         copilotModel: "gpt-4.1",
         genericBaseUrl: "https://api.openai.com/v1",
@@ -222,12 +224,19 @@
             const headers = options?.headers || {};
             if (body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
 
+            console.log(`%c[PAX AI Network] Initiating ${method} request to ${url}...`, "color: orange");
+
             GM_xmlhttpRequest({
                 method: method,
                 url: url,
                 headers: headers,
                 data: body,
+                timeout: 60000,
                 onload: function (response) {
+                    console.log(`%c[PAX AI Network] Response received from ${url} | Status: ${response.status}`, "color: " + (response.status >= 200 && response.status < 300 ? "lime" : "red"));
+                    if (response.status >= 400) {
+                        console.error(`[PAX AI Network] HTTP Error ${response.status}:`, response.responseText);
+                    }
                     try {
                         const parsed = response.responseText ? JSON.parse(response.responseText) : {};
                         resolve({
@@ -237,6 +246,7 @@
                             text: response.responseText
                         });
                     } catch (e) {
+                        console.warn(`[PAX AI Network] Failed to parse JSON response from ${url}`);
                         resolve({
                             ok: false,
                             status: response.status,
@@ -245,8 +255,17 @@
                         });
                     }
                 },
-                onerror: function () {
+                onerror: function (err) {
+                    console.error(`[PAX AI Network] Network error (onerror) for ${url}:`, err);
                     reject(new Error("Network error: " + url));
+                },
+                onabort: function () {
+                    console.error(`[PAX AI Network] Request aborted for ${url}`);
+                    reject(new Error("Request aborted: " + url));
+                },
+                ontimeout: function () {
+                    console.error(`[PAX AI Network] Request timed out (60s) for ${url}`);
+                    reject(new Error("Request timed out: " + url));
                 }
             });
         });
@@ -665,7 +684,7 @@
 
                     <div id="ph-deepseek-fields" style="display: ${settings.provider === 'deepseek' ? 'block' : 'none'};">
                         <label for="ph-deepseek-model">Model:</label>
-                        <input type="text" id="ph-deepseek-model" value="${settings.deepseekModel}" placeholder="deepseek-chat">
+                        <input type="text" id="ph-deepseek-model" value="${settings.deepseekModel}" placeholder="deepseek-v4-pro">
                     </div>
 
                     <div id="ph-copilot-fields" style="display: ${settings.provider === 'copilot' ? 'block' : 'none'};">
@@ -919,35 +938,52 @@
                 if (settings.provider === 'google') {
                     responseText = await withRetry(async function () {
                         const googleUrl = `https://generativelanguage.googleapis.com/v1beta/models/${settings.modelName}:generateContent?key=${settings.apiKey}`;
-                        const genConfig = {
-                            temperature: 0.7,
-                            thinkingConfig: {
-                                include_thoughts: true,
-                                thinking_budget: settings.thinkingBudget
+
+                        async function doGoogleRequest(useNativeSchema) {
+                            const genConfig = {
+                                temperature: 0.7,
+                                thinkingConfig: {
+                                    include_thoughts: true,
+                                    thinking_budget: settings.thinkingBudget
+                                }
+                            };
+                            var promptText = finalPrompt;
+                            if (isAction && gameSchema) {
+                                if (useNativeSchema) {
+                                    var converted = convertSchemaForGoogle(gameSchema);
+                                    console.log("[PAX AI] Converted Google schema:", JSON.stringify(converted, null, 2));
+                                    genConfig.responseMimeType = "application/json";
+                                    genConfig.responseSchema = converted;
+                                    console.log("%c[PAX AI] Using native responseSchema for: " + (gameSchema.name || "unknown"), "color: cyan");
+                                } else {
+                                    genConfig.responseMimeType = "application/json";
+                                    var innerSchema = gameSchema.schema || gameSchema;
+                                    promptText += "\n\nYou must respond with a valid JSON object matching this schema:\n" + JSON.stringify(innerSchema);
+                                    console.log("%c[PAX AI] Fallback: injecting schema into prompt for: " + (gameSchema.name || "unknown"), "color: yellow");
+                                }
                             }
-                        };
-                        if (isAction && gameSchema) {
-                            genConfig.responseMimeType = "application/json";
-                            genConfig.responseSchema = convertSchemaForGoogle(gameSchema);
-                            console.log("%c[PAX AI] Using native responseSchema for: " + (gameSchema.name || "unknown"), "color: cyan");
+                            const googlePayload = {
+                                contents: [{ parts: [{ text: promptText }] }],
+                                generationConfig: genConfig
+                            };
+                            return await fetchApi(googleUrl, {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: googlePayload
+                            });
                         }
-                        const googlePayload = {
-                            contents: [{ parts: [{ text: finalPrompt }] }],
-                            generationConfig: genConfig
-                        };
-                        const myResponse = await originalFetch(googleUrl, {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify(googlePayload)
-                        });
-                        if (!myResponse.ok) {
-                            const errText = await myResponse.text();
-                            const err = new Error("Google API Error: " + errText);
-                            err.status = myResponse.status;
+
+                        var result = await doGoogleRequest(isAction && !!gameSchema);
+                        if (!result.ok && result.status === 400 && isAction && gameSchema) {
+                            console.warn("[PAX AI] Google rejected schema (400), retrying with prompt-injected schema...");
+                            result = await doGoogleRequest(false);
+                        }
+                        if (!result.ok) {
+                            const err = new Error("Google API Error: " + (result.text || "HTTP " + result.status));
+                            err.status = result.status;
                             throw err;
                         }
-                        const myJson = await myResponse.json();
-                        const parts = myJson.candidates?.[0]?.content?.parts || [];
+                        const parts = result.data?.candidates?.[0]?.content?.parts || [];
                         for (let i = parts.length - 1; i >= 0; i--) {
                             if (parts[i].text) return parts[i].text;
                         }
@@ -1027,6 +1063,9 @@
                             model: modelId,
                             messages: [{ role: "user", content: finalPrompt }]
                         };
+                        if (settings.provider === 'deepseek') {
+                            payload.thinking = { type: "enabled" };
+                        }
                         if (isAction && gameSchema) {
                             if (settings.provider === 'deepseek') {
                                 payload.response_format = { type: "json_object" };
@@ -1053,7 +1092,13 @@
                             err.status = result.status;
                             throw err;
                         }
-                        return result.data?.choices?.[0]?.message?.content || "";
+
+                        var choiceMsg = result.data?.choices?.[0]?.message;
+                        if (choiceMsg && choiceMsg.reasoning_content) {
+                            console.log("%c[PAX AI DeepSeek Think]\n" + choiceMsg.reasoning_content, "color: #b19cd9; font-style: italic;");
+                        }
+
+                        return choiceMsg ? (choiceMsg.content || "") : "";
                     });
                 }
 
@@ -1072,17 +1117,30 @@
                         console.error("[PAX AI] JSON not found in response for action!");
                     }
 
-                    // Unwrap schema wrapper: AI may return {name,strict,schema:{message,mapMode}}
-                    // Game expects {message,mapMode} directly
+                    // Unwrap schema wrapper & Auto-Repair
+                    let parsed = null;
                     try {
-                        var parsed = JSON.parse(cleanText);
-                        if (parsed && parsed.schema && typeof parsed.schema === "object") {
+                        parsed = JSON.parse(cleanText);
+                    } catch (e) {
+                        const appendOptions = ['}', ']}', ']}}', '}]}', '"]}', '"}', '"]}}', '"]}]}', '}', ']}', '}]'];
+                        for (let i = 0; i < appendOptions.length; i++) {
+                            try {
+                                parsed = JSON.parse(cleanText + appendOptions[i]);
+                                cleanText = cleanText + appendOptions[i];
+                                console.warn("[PAX AI] Auto-repaired truncated JSON by appending: " + appendOptions[i]);
+                                break;
+                            } catch(err) {}
+                        }
+                        if (!parsed) {
+                            console.error("[PAX AI] INVALID JSON (Unrepairable):", cleanText);
+                        }
+                    }
+
+                    if (parsed) {
+                        if (parsed.schema && typeof parsed.schema === "object") {
                             cleanText = JSON.stringify(parsed.schema);
                         }
-                        JSON.parse(cleanText);
                         console.log("%c[PAX AI] JSON VALID.", "color: lime");
-                    } catch (e) {
-                        console.error("[PAX AI] INVALID JSON:", cleanText);
                     }
                 }
 
@@ -1112,11 +1170,9 @@
                     responseBody = JSON.stringify({ message: cleanText });
                 }
 
-                // We must return a Response object that the page can understand.
-                // Since we are in the sandbox, 'Response' might be the sandbox's Response.
-                // Usually this is fine, but sometimes we need to construct it in the page context.
-                // For now, standard Response usually works across the boundary in modern TM.
-                return new Response(responseBody, {
+                // We MUST return an unsafeWindow.Response object so the page's JS can read it.
+                // Using the sandbox's Response causes the page's .json() call to throw an Illegal Invocation error and hang!
+                return new unsafeWindow.Response(responseBody, {
                     status: 200,
                     headers: { "Content-Type": "application/json" }
                 });
