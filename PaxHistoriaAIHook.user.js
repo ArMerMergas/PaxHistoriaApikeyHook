@@ -897,8 +897,36 @@
     // When using GM_ functions, we must use unsafeWindow to access the page's fetch
     const originalFetch = unsafeWindow.fetch.bind(unsafeWindow);
 
+    var _inflightRequests = {};
+
     unsafeWindow.fetch = async function (url, options) {
         if (url && url.toString().includes('/api/simple-chat')) {
+            var reqKey = null;
+            try {
+                var bodyStr = options && options.body ? options.body : "";
+                reqKey = bodyStr.length > 100 ? bodyStr.substring(0, 100) + bodyStr.length : bodyStr;
+            } catch (e) { }
+
+            if (reqKey && _inflightRequests[reqKey]) {
+                console.log("%c[PAX AI] Duplicate request detected, waiting for existing response...", "color: #ff9800");
+                try {
+                    var existingResult = await _inflightRequests[reqKey];
+                    return new unsafeWindow.Response(existingResult.body, {
+                        status: existingResult.status,
+                        headers: existingResult.headers
+                    });
+                } catch (e) {
+                    console.warn("[PAX AI] Existing request failed, proceeding with new one");
+                }
+            }
+
+            var resolveInflight, rejectInflight;
+            if (reqKey) {
+                _inflightRequests[reqKey] = new Promise(function (res, rej) {
+                    resolveInflight = res;
+                    rejectInflight = rej;
+                });
+            }
             const settings = loadSettings();
 
             const noApiKeyProviders = ['ollama', 'lmstudio', 'copilot', 'generic'];
@@ -1169,8 +1197,10 @@
                     responseBody = JSON.stringify({ message: cleanText });
                 }
 
-                // We MUST return an unsafeWindow.Response object so the page's JS can read it.
-                // Using the sandbox's Response causes the page's .json() call to throw an Illegal Invocation error and hang!
+                var resultResponse = { body: responseBody, status: 200, headers: { "Content-Type": "application/json" } };
+                if (resolveInflight) resolveInflight(resultResponse);
+                if (reqKey) delete _inflightRequests[reqKey];
+
                 return new unsafeWindow.Response(responseBody, {
                     status: 200,
                     headers: { "Content-Type": "application/json" }
@@ -1178,11 +1208,8 @@
 
             } catch (e) {
                 console.error("[PAX AI] Critical Failure:", e);
-                // Fallback to original fetch if our hook fails? 
-                // Usually better to let the user know, but for game stability maybe fallback.
-                // However, if we don't have a key, we already returned. If we have a key and it failed, 
-                // the original game backend might not be what the user wants. 
-                // But let's return originalFetch to be safe so the game doesn't just hang.
+                if (rejectInflight) rejectInflight(e);
+                if (reqKey) delete _inflightRequests[reqKey];
                 return originalFetch(url, options);
             }
         }
