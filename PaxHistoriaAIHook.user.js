@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Pax Historia: Custom AI Backend (Multi-Provider)
 // @namespace    http://tampermonkey.net/
-// @version      15.1
-// @description  Custom AI backend for Pax Historia. Supports Google, OpenRouter, OpenAI, Groq, Ollama, LM Studio, Together, Fireworks, Mistral, Anthropic, Copilot, Generic, DeepSeek.
+// @version      15.2
+// @description  Custom AI backend for Pax Historia. Supports Google, Vertex AI, OpenRouter, OpenAI, Groq, Ollama, LM Studio, Together, Fireworks, Mistral, Anthropic, Copilot, Generic, DeepSeek.
 // @author       You
 // @match        https://paxhistoria.co/*
 // @match        https://www.paxhistoria.co/*
@@ -10,6 +10,7 @@
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
 // @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 // @connect      localhost
 // @connect      127.0.0.1
 // @connect      *
@@ -107,6 +108,11 @@
         provider: "google",
         apiKey: "",
         modelName: "gemini-3-flash-preview",
+        vertexServiceAccountJson: "",
+        vertexProjectId: "",
+        vertexLocation: "global",
+        vertexModel: "gemini-2.5-flash",
+        vertexThinkingBudget: 4096,
         openRouterModel: "google/gemini-2.0-flash-thinking-exp:free",
         openaiModel: "gpt-4o-mini",
         groqModel: "llama-3.1-70b-versatile",
@@ -133,6 +139,11 @@
             provider: GM_getValue("provider", DEFAULTS.provider),
             apiKey: GM_getValue("apiKey", DEFAULTS.apiKey),
             modelName: GM_getValue("modelName", DEFAULTS.modelName),
+            vertexServiceAccountJson: GM_getValue("vertexServiceAccountJson", DEFAULTS.vertexServiceAccountJson),
+            vertexProjectId: GM_getValue("vertexProjectId", DEFAULTS.vertexProjectId),
+            vertexLocation: GM_getValue("vertexLocation", DEFAULTS.vertexLocation),
+            vertexModel: GM_getValue("vertexModel", DEFAULTS.vertexModel),
+            vertexThinkingBudget: GM_getValue("vertexThinkingBudget", DEFAULTS.vertexThinkingBudget),
             openRouterModel: GM_getValue("openRouterModel", DEFAULTS.openRouterModel),
             openaiModel: GM_getValue("openaiModel", DEFAULTS.openaiModel),
             groqModel: GM_getValue("groqModel", DEFAULTS.groqModel),
@@ -158,6 +169,12 @@
         GM_setValue("provider", settings.provider);
         GM_setValue("apiKey", settings.apiKey);
         GM_setValue("modelName", settings.modelName);
+        if (settings.vertexServiceAccountJson !== GM_getValue("vertexServiceAccountJson", "")) vertexTokenCache = null;
+        GM_setValue("vertexServiceAccountJson", settings.vertexServiceAccountJson);
+        GM_setValue("vertexProjectId", settings.vertexProjectId);
+        GM_setValue("vertexLocation", settings.vertexLocation);
+        GM_setValue("vertexModel", settings.vertexModel);
+        GM_setValue("vertexThinkingBudget", settings.vertexThinkingBudget);
         GM_setValue("openRouterModel", settings.openRouterModel);
         GM_setValue("openaiModel", settings.openaiModel);
         GM_setValue("groqModel", settings.groqModel);
@@ -220,7 +237,7 @@
     function fetchApi(url, options) {
         return new Promise(function (resolve, reject) {
             const method = options?.method || "GET";
-            const body = options?.body ? JSON.stringify(options.body) : undefined;
+            const body = typeof options?.body === "string" ? options.body : (options?.body ? JSON.stringify(options.body) : undefined);
             const headers = options?.headers || {};
             if (body && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
 
@@ -231,9 +248,10 @@
                 url: url,
                 headers: headers,
                 data: body,
+                timeout: options?.timeout || 0,
                 onload: function (response) {
                     console.log(`%c[PAX AI Network] Response received from ${url} | Status: ${response.status}`, "color: " + (response.status >= 200 && response.status < 300 ? "lime" : "red"));
-                    if (response.status >= 400) {
+                    if (response.status >= 400 && !options?.sensitive) {
                         console.error(`[PAX AI Network] HTTP Error ${response.status}:`, response.responseText);
                     }
                     try {
@@ -255,7 +273,7 @@
                     }
                 },
                 onerror: function (err) {
-                    console.error(`[PAX AI Network] Network error (onerror) for ${url}:`, err);
+                    console.error(`[PAX AI Network] Network error (onerror) for ${url}:`, options?.sensitive ? "Request failed" : err);
                     reject(new Error("Network error: " + url));
                 },
                 onabort: function () {
@@ -263,16 +281,154 @@
                     reject(new Error("Request aborted: " + url));
                 },
                 ontimeout: function () {
-                    console.error(`[PAX AI Network] Request timed out (60s) for ${url}`);
-                    reject(new Error("Request timed out: " + url));
+                    console.error(`[PAX AI Network] Request timed out for ${url}`);
+                    reject(new Error("Request timeout: " + url));
                 }
             });
+        });
+    }
+
+    const VERTEX_TOKEN_URL = "https://oauth2.googleapis.com/token";
+    let vertexTokenCache = null;
+
+    function parseVertexServiceAccount(json) {
+        let account;
+        try { account = JSON.parse(json); } catch {
+            throw new Error("Vertex AI: import a valid service account JSON key.");
+        }
+        if (!account || account.type !== "service_account" ||
+            typeof account.client_email !== "string" || !account.client_email.includes("@") ||
+            typeof account.private_key !== "string" ||
+            !/^-----BEGIN PRIVATE KEY-----\s+[A-Za-z0-9+/=\s]+\s+-----END PRIVATE KEY-----\s*$/.test(account.private_key)) {
+            throw new Error("Vertex AI: JSON must contain type service_account, client_email and a PEM private_key.");
+        }
+        return account;
+    }
+
+    function getVertexConfig(settings) {
+        const account = parseVertexServiceAccount(settings.vertexServiceAccountJson);
+        const project = (settings.vertexProjectId || account.project_id || "").trim();
+        const location = (settings.vertexLocation || DEFAULTS.vertexLocation).trim().toLowerCase();
+        const model = (settings.vertexModel || DEFAULTS.vertexModel).trim();
+        if (!/^[a-zA-Z0-9_-]+$/.test(project)) throw new Error("Vertex AI: enter a valid Google Cloud Project ID.");
+        if (!/^(global|[a-z]+(?:-[a-z0-9]+)+)$/.test(location)) throw new Error("Vertex AI: location must be global or a region such as us-central1.");
+        if (!/^gemini-[a-zA-Z0-9._-]+$/.test(model)) throw new Error("Vertex AI: enter a Gemini model ID, such as gemini-2.5-flash.");
+        if (!Number.isInteger(settings.vertexThinkingBudget) || settings.vertexThinkingBudget < -1) {
+            throw new Error("Vertex AI: thinking budget must be -1 (automatic), 0, or a positive integer.");
+        }
+        const host = location === "global" ? "aiplatform.googleapis.com" : location + "-aiplatform.googleapis.com";
+        return {
+            account: account,
+            url: `https://${host}/v1/projects/${encodeURIComponent(project)}/locations/${location}/publishers/google/models/${encodeURIComponent(model)}:generateContent`
+        };
+    }
+
+    function base64Url(bytes) {
+        return btoa(Array.from(new Uint8Array(bytes), byte => String.fromCharCode(byte)).join(""))
+            .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    }
+
+    function getVertexGenerationConfig(settings) {
+        const config = { temperature: 0.7 };
+        if (/^gemini-2\.5-/.test(settings.vertexModel || DEFAULTS.vertexModel)) {
+            config.thinkingConfig = { thinkingBudget: settings.vertexThinkingBudget };
+        }
+        return config;
+    }
+
+    function vertexApiError(result, label) {
+        const detail = result.data?.error?.message || result.data?.error_description ||
+            (typeof result.data?.error === "string" ? result.data.error : "HTTP " + result.status);
+        const error = new Error(label + ": " + detail);
+        error.status = result.status;
+        return error;
+    }
+
+    async function getVertexAccessToken(settings) {
+        const source = settings.vertexServiceAccountJson;
+        if (!vertexTokenCache || vertexTokenCache.source !== source) {
+            vertexTokenCache = { source: source, token: "", expiresAt: 0, pending: null };
+        }
+        const cache = vertexTokenCache;
+        if (cache.token && Date.now() < cache.expiresAt - 60000) return cache.token;
+        if (cache.pending) return cache.pending;
+        cache.pending = (async function () {
+            const account = parseVertexServiceAccount(source);
+            if (!crypto.subtle) throw new Error("Vertex AI: Web Crypto is unavailable in this browser.");
+            const pem = account.private_key.replace(/-----BEGIN PRIVATE KEY-----|-----END PRIVATE KEY-----|\s/g, "");
+            let key;
+            try {
+                key = await crypto.subtle.importKey("pkcs8", Uint8Array.from(atob(pem), ch => ch.charCodeAt(0)),
+                    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["sign"]);
+            } catch {
+                throw new Error("Vertex AI: the service account RSA private key is invalid.");
+            }
+            const encoder = new TextEncoder();
+            const now = Math.floor(Date.now() / 1000);
+            const header = { alg: "RS256", typ: "JWT" };
+            if (account.private_key_id) header.kid = account.private_key_id;
+            const claims = {
+                iss: account.client_email,
+                scope: "https://www.googleapis.com/auth/cloud-platform",
+                aud: VERTEX_TOKEN_URL,
+                iat: now,
+                exp: now + 3600
+            };
+            const unsigned = base64Url(encoder.encode(JSON.stringify(header))) + "." + base64Url(encoder.encode(JSON.stringify(claims)));
+            const signature = await crypto.subtle.sign("RSASSA-PKCS1-v1_5", key, encoder.encode(unsigned));
+            const assertion = unsigned + "." + base64Url(signature);
+            const tokenData = new URLSearchParams({ grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion: assertion }).toString();
+            const result = await withRetry(async function () {
+                const response = await fetchApi(VERTEX_TOKEN_URL, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+                    body: tokenData,
+                    sensitive: true,
+                    timeout: 60000
+                });
+                if (!response.ok) throw vertexApiError(response, "Vertex AI authorization failed");
+                return response;
+            });
+            const lifetime = Number(result.data?.expires_in);
+            if (typeof result.data?.access_token !== "string" || !result.data.access_token || !Number.isFinite(lifetime) || lifetime <= 0) {
+                throw new Error("Vertex AI: Google returned an invalid OAuth token response.");
+            }
+            cache.token = result.data.access_token;
+            cache.expiresAt = Date.now() + lifetime * 1000;
+            return cache.token;
+        })();
+        try { return await cache.pending; } finally { cache.pending = null; }
+    }
+
+    async function requestVertexApi(settings, payload) {
+        const config = getVertexConfig(settings);
+        let token = await getVertexAccessToken(settings);
+        return withRetry(async function () {
+            async function send() {
+                return fetchApi(config.url, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+                    body: payload,
+                    timeout: 180000
+                });
+            }
+            let result = await send();
+            if (result.status === 401) {
+                if (vertexTokenCache?.source === settings.vertexServiceAccountJson && vertexTokenCache.token === token) {
+                    vertexTokenCache.expiresAt = 0;
+                }
+                token = await getVertexAccessToken(settings);
+                result = await send();
+            }
+            if (!result.ok && isRetryableError(result.status)) throw vertexApiError(result, "Vertex AI API Error");
+            return result;
         });
     }
 
     function getModelLabel(settings) {
         switch (settings.provider) {
             case "google": return settings.modelName;
+            case "vertex": return settings.vertexModel;
             case "openrouter": return (settings.openRouterModel || "").split("/").pop() || "?";
             case "copilot": return settings.copilotModel;
             case "openai": return settings.openaiModel;
@@ -583,7 +739,7 @@
                 #ph-ai-modal-box { background: #222; color: #fff; padding: 16px; border-radius: 8px; width: 100%; max-width: 420px; max-height: calc(100vh - 24px); overflow-y: auto; box-shadow: 0 4px 20px rgba(0,0,0,0.5); box-sizing: border-box; }
                 #ph-ai-modal-box h2 { margin: 0 0 12px; font-size: 1.1rem; border-bottom: 1px solid #444; padding-bottom: 8px; }
                 #ph-ai-modal-box label { display: block; margin-top: 10px; font-size: 0.9rem; }
-                #ph-ai-modal-box input, #ph-ai-modal-box select { width: 100%; padding: 8px; margin-top: 4px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px; box-sizing: border-box; font-size: 0.9rem; }
+                #ph-ai-modal-box input, #ph-ai-modal-box select, #ph-ai-modal-box textarea { width: 100%; padding: 8px; margin-top: 4px; background: #333; color: #fff; border: 1px solid #555; border-radius: 4px; box-sizing: border-box; font-size: 0.9rem; }
                 #ph-ai-modal-box select[multiple] { min-height: 120px; max-height: 40vh; }
                 #ph-ai-modal-box button { padding: 8px 14px; font-size: 0.9rem; border: none; border-radius: 4px; cursor: pointer; }
                 #ph-ai-modal-buttons { margin-top: 16px; display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
@@ -596,6 +752,7 @@
                     <label for="ph-provider">Provider:</label>
                     <select id="ph-provider">
                         <option value="google" ${settings.provider === 'google' ? 'selected' : ''}>Google AI Studio</option>
+                        <option value="vertex" ${settings.provider === 'vertex' ? 'selected' : ''}>Vertex AI (Gemini / service account)</option>
                         <option value="openrouter" ${settings.provider === 'openrouter' ? 'selected' : ''}>OpenRouter</option>
                         <option value="openai" ${settings.provider === 'openai' ? 'selected' : ''}>OpenAI</option>
                         <option value="groq" ${settings.provider === 'groq' ? 'selected' : ''}>Groq</option>
@@ -610,7 +767,7 @@
                         <option value="generic" ${settings.provider === 'generic' ? 'selected' : ''}>Generic (URL)</option>
                     </select>
 
-                    <div id="ph-api-key-container" style="display: ${['ollama', 'lmstudio', 'copilot', 'generic'].indexOf(settings.provider) !== -1 ? 'none' : 'block'};">
+                    <div id="ph-api-key-container" style="display: ${['vertex', 'ollama', 'lmstudio', 'copilot', 'generic'].indexOf(settings.provider) !== -1 ? 'none' : 'block'};">
                         <label for="ph-api-key">API Key:</label>
                         <input type="text" id="ph-api-key" value="${settings.apiKey}" placeholder="sk-...">
                     </div>
@@ -620,6 +777,32 @@
                         <input type="text" id="ph-model-name" value="${settings.modelName}">
                         <label for="ph-thinking-budget">Thinking Budget (Tokens):</label>
                         <input type="number" id="ph-thinking-budget" value="${settings.thinkingBudget}">
+                    </div>
+
+                    <div id="ph-vertex-fields" style="display: ${settings.provider === 'vertex' ? 'block' : 'none'};">
+                        <label for="ph-vertex-service-account-file">Service account JSON key:</label>
+                        <input type="file" id="ph-vertex-service-account-file" accept=".json,application/json">
+                        <label for="ph-vertex-service-account-json">Or paste a JSON key:</label>
+                        <textarea id="ph-vertex-service-account-json" rows="4" autocomplete="off" spellcheck="false" placeholder="Paste a new key; leave empty to keep the saved account"></textarea>
+                        <div style="margin-top: 8px;">
+                            <button id="ph-vertex-clear-btn" type="button" style="background: #555; color: #fff;">Clear account</button>
+                            <span id="ph-vertex-account-status" style="font-size: 0.85rem;"></span>
+                        </div>
+                        <p style="font-size: 0.8rem; color: #aaa;">The key is saved in Tampermonkey storage. OAuth tokens refresh automatically.</p>
+                        <label for="ph-vertex-project">Google Cloud Project ID (optional):</label>
+                        <input type="text" id="ph-vertex-project" placeholder="Uses project_id from the JSON key">
+                        <label for="ph-vertex-location">Location:</label>
+                        <input type="text" id="ph-vertex-location" placeholder="global or us-central1">
+                        <label for="ph-vertex-model">Gemini model:</label>
+                        <input type="text" id="ph-vertex-model" placeholder="gemini-2.5-flash">
+                        <label for="ph-vertex-thinking-budget">Thinking Budget (Gemini 2.5, -1 = automatic):</label>
+                        <input type="number" id="ph-vertex-thinking-budget" min="-1" step="1">
+                        <p style="font-size: 0.8rem; color: #aaa;">Other Gemini versions use their default thinking settings.</p>
+                        <div style="margin-top: 8px;">
+                            <button id="ph-test-vertex-btn" type="button" style="background: #28a745; color: #fff;">Test connection</button>
+                            <span id="ph-vertex-status" role="status" style="font-size: 0.85rem; margin-left: 8px;"></span>
+                        </div>
+                        <p style="font-size: 0.8rem; color: #aaa;">Test sends a short request to the selected model and may incur usage charges.</p>
                     </div>
 
                     <div id="ph-openrouter-fields" style="display: ${settings.provider === 'openrouter' ? 'block' : 'none'};">
@@ -722,12 +905,80 @@
         div.innerHTML = modalHTML;
         document.body.appendChild(div);
 
+        let vertexCredentialDraft = settings.vertexServiceAccountJson;
+        let vertexAccountCleared = false;
+        const vertexJsonInput = document.getElementById('ph-vertex-service-account-json');
+        const vertexStatus = document.getElementById('ph-vertex-status');
+        const vertexAccountStatus = document.getElementById('ph-vertex-account-status');
+        document.getElementById('ph-vertex-project').value = settings.vertexProjectId;
+        document.getElementById('ph-vertex-location').value = settings.vertexLocation;
+        document.getElementById('ph-vertex-model').value = settings.vertexModel;
+        document.getElementById('ph-vertex-thinking-budget').value = settings.vertexThinkingBudget;
+        vertexAccountStatus.textContent = vertexCredentialDraft ? 'Saved account available' : 'No account';
+
+        function readVertexSettings() {
+            return {
+                vertexServiceAccountJson: vertexJsonInput.value.trim() || vertexCredentialDraft,
+                vertexProjectId: document.getElementById('ph-vertex-project').value.trim(),
+                vertexLocation: document.getElementById('ph-vertex-location').value.trim() || DEFAULTS.vertexLocation,
+                vertexModel: document.getElementById('ph-vertex-model').value.trim() || DEFAULTS.vertexModel,
+                vertexThinkingBudget: Number(document.getElementById('ph-vertex-thinking-budget').value.trim() || DEFAULTS.vertexThinkingBudget)
+            };
+        }
+
+        function showVertexError(error) {
+            vertexStatus.textContent = error.message;
+            vertexStatus.style.color = '#dc3545';
+        }
+
+        document.getElementById('ph-vertex-service-account-file').addEventListener('change', async function (event) {
+            const file = event.target.files[0];
+            if (!file) return;
+            try {
+                const json = await file.text();
+                const account = parseVertexServiceAccount(json);
+                vertexCredentialDraft = json.trim();
+                vertexAccountCleared = false;
+                vertexJsonInput.value = '';
+                vertexAccountStatus.textContent = 'Imported: ' + account.client_email + ' (save to apply)';
+                vertexStatus.textContent = '';
+            } catch (error) { showVertexError(error); }
+            event.target.value = '';
+        });
+        document.getElementById('ph-vertex-clear-btn').addEventListener('click', function () {
+            vertexCredentialDraft = '';
+            vertexAccountCleared = true;
+            vertexJsonInput.value = '';
+            vertexAccountStatus.textContent = 'Account cleared (save to apply)';
+            vertexStatus.textContent = '';
+        });
+        document.getElementById('ph-test-vertex-btn').addEventListener('click', async function (event) {
+            const button = event.currentTarget;
+            button.disabled = true;
+            vertexStatus.textContent = 'Testing...';
+            vertexStatus.style.color = '#ffc107';
+            try {
+                const vertexSettings = readVertexSettings();
+                const result = await requestVertexApi(vertexSettings, {
+                    contents: [{ role: 'user', parts: [{ text: 'Reply with OK.' }] }],
+                    generationConfig: getVertexGenerationConfig(vertexSettings)
+                });
+                if (!result.ok) throw vertexApiError(result, 'Vertex AI connection failed');
+                if (!result.data?.candidates?.[0]?.content?.parts?.some(part => part.text && !part.thought)) {
+                    throw new Error('Vertex AI: the model returned no text. Check model availability.');
+                }
+                vertexStatus.textContent = 'OK (model responded)';
+                vertexStatus.style.color = '#28a745';
+            } catch (error) { showVertexError(error); }
+            finally { button.disabled = false; }
+        });
+
         // Event Listeners
         function updateProviderVisibility() {
             const provider = document.getElementById('ph-provider').value;
-            const noApiKey = ['ollama', 'lmstudio', 'copilot', 'generic'];
+            const noApiKey = ['vertex', 'ollama', 'lmstudio', 'copilot', 'generic'];
             document.getElementById('ph-api-key-container').style.display = noApiKey.indexOf(provider) !== -1 ? 'none' : 'block';
-            ['google', 'openrouter', 'openai', 'groq', 'ollama', 'lmstudio', 'together', 'fireworks', 'mistral', 'anthropic', 'deepseek', 'copilot', 'generic'].forEach(function (p) {
+            ['google', 'vertex', 'openrouter', 'openai', 'groq', 'ollama', 'lmstudio', 'together', 'fireworks', 'mistral', 'anthropic', 'deepseek', 'copilot', 'generic'].forEach(function (p) {
                 var el = document.getElementById('ph-' + p + '-fields');
                 if (el) el.style.display = p === provider ? 'block' : 'none';
             });
@@ -867,6 +1118,17 @@
                 genericApiKey: getVal('ph-generic-api-key', DEFAULTS.genericApiKey),
                 thinkingBudget: parseInt(document.getElementById('ph-thinking-budget').value, 10) || DEFAULTS.thinkingBudget
             };
+            const vertexSettings = readVertexSettings();
+            try {
+                if (vertexSettings.vertexServiceAccountJson) parseVertexServiceAccount(vertexSettings.vertexServiceAccountJson);
+                if (newSettings.provider === 'vertex' && (!vertexAccountCleared || vertexSettings.vertexServiceAccountJson)) getVertexConfig(vertexSettings);
+            } catch (error) {
+                showVertexError(error);
+                document.getElementById('ph-provider').value = 'vertex';
+                updateProviderVisibility();
+                return;
+            }
+            Object.assign(newSettings, vertexSettings);
             saveSettings(newSettings);
             document.getElementById('ph-ai-settings-modal').remove();
             createOrUpdateIndicator();
@@ -929,7 +1191,7 @@
             }
             const settings = loadSettings();
 
-            const noApiKeyProviders = ['ollama', 'lmstudio', 'copilot', 'generic'];
+            const noApiKeyProviders = ['vertex', 'ollama', 'lmstudio', 'copilot', 'generic'];
             const needsApiKey = noApiKeyProviders.indexOf(settings.provider) === -1;
             if (needsApiKey && !settings.apiKey) {
                 console.warn("[PAX AI] No API Key configured. Please open settings via Tampermonkey menu.");
@@ -962,12 +1224,13 @@
 
                 let responseText = "";
 
-                if (settings.provider === 'google') {
+                if (settings.provider === 'google' || settings.provider === 'vertex') {
                     responseText = await (async function () {
-                        const googleUrl = `https://generativelanguage.googleapis.com/v1beta/models/${settings.modelName}:generateContent?key=${settings.apiKey}`;
+                        const isVertex = settings.provider === 'vertex';
+                        const googleUrl = isVertex ? null : `https://generativelanguage.googleapis.com/v1beta/models/${settings.modelName}:generateContent?key=${settings.apiKey}`;
 
                         async function doGoogleRequest(useNativeSchema) {
-                            const genConfig = {
+                            const genConfig = isVertex ? getVertexGenerationConfig(settings) : {
                                 temperature: 0.7,
                                 thinkingConfig: {
                                     include_thoughts: true,
@@ -990,9 +1253,10 @@
                                 }
                             }
                             const googlePayload = {
-                                contents: [{ parts: [{ text: promptText }] }],
+                                contents: [{ role: "user", parts: [{ text: promptText }] }],
                                 generationConfig: genConfig
                             };
+                            if (isVertex) return requestVertexApi(settings, googlePayload);
                             return await fetchApi(googleUrl, {
                                 method: "POST",
                                 headers: { "Content-Type": "application/json" },
@@ -1006,11 +1270,17 @@
                             result = await doGoogleRequest(false);
                         }
                         if (!result.ok) {
+                            if (isVertex) throw vertexApiError(result, "Vertex AI API Error");
                             const err = new Error("Google API Error: " + (result.text || "HTTP " + result.status));
                             err.status = result.status;
                             throw err;
                         }
                         const parts = result.data?.candidates?.[0]?.content?.parts || [];
+                        if (isVertex) {
+                            const text = parts.filter(part => !part.thought && typeof part.text === 'string').map(part => part.text).join('');
+                            if (!text) throw new Error("Vertex AI: the model returned no text (" + (result.data?.promptFeedback?.blockReason || result.data?.candidates?.[0]?.finishReason || "empty response") + ").");
+                            return text;
+                        }
                         for (let i = parts.length - 1; i >= 0; i--) {
                             if (parts[i].text) return parts[i].text;
                         }
@@ -1208,6 +1478,16 @@
 
             } catch (e) {
                 console.error("[PAX AI] Critical Failure:", e);
+                if (settings.provider === 'vertex') {
+                    const failure = {
+                        body: JSON.stringify({ error: e.message || "Vertex AI request failed" }),
+                        status: e.status >= 400 && e.status < 600 ? e.status : 502,
+                        headers: { "Content-Type": "application/json" }
+                    };
+                    if (resolveInflight) resolveInflight(failure);
+                    if (reqKey) delete _inflightRequests[reqKey];
+                    return new unsafeWindow.Response(failure.body, { status: failure.status, headers: failure.headers });
+                }
                 if (rejectInflight) rejectInflight(e);
                 if (reqKey) delete _inflightRequests[reqKey];
                 return originalFetch(url, options);
