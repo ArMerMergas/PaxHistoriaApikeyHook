@@ -111,8 +111,8 @@
         vertexServiceAccountJson: "",
         vertexProjectId: "",
         vertexLocation: "global",
-        vertexModel: "gemini-2.5-flash",
-        vertexThinkingBudget: 4096,
+        vertexModel: "gemini-3.5-flash",
+        vertexThinkingBudget: -1,
         openRouterModel: "google/gemini-2.0-flash-thinking-exp:free",
         openaiModel: "gpt-4o-mini",
         groqModel: "llama-3.1-70b-versatile",
@@ -130,7 +130,7 @@
         genericBaseUrl: "https://api.openai.com/v1",
         genericModel: "gpt-4o-mini",
         genericApiKey: "",
-        thinkingBudget: 4096
+        thinkingBudget: -1
     };
 
     // === SETTINGS MANAGEMENT ===
@@ -683,7 +683,7 @@
         var url = PROVIDER_URLS.anthropic + "/messages";
         var body = {
             model: settings.anthropicModel || DEFAULTS.anthropicModel,
-            max_tokens: 4096,
+            max_tokens: -1,
             messages: [{ role: "user", content: finalPrompt }]
         };
         if (useStructuredOutput && gameSchema && gameSchema.schema) {
