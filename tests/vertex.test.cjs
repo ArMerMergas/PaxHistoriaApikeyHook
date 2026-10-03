@@ -14,7 +14,7 @@ const account = {
 const accountJson = JSON.stringify(account);
 const source = readFileSync(join(__dirname, '..', 'PaxHistoriaAIHook.user.js'), 'utf8')
     .replace('    ensureIndicator();', '')
-    .replace(/\}\)\(\);\s*$/, 'globalThis.api = { loadSettings, saveSettings, getVertexConfig, getVertexAccessToken, requestVertexApi, createSettingsModal, partialChatMessage }; })();');
+    .replace(/\}\)\(\);\s*$/, 'globalThis.api = { loadSettings, saveSettings, getVertexConfig, getVertexAccessToken, requestVertexApi, createSettingsModal }; })();');
 
 function harness(overrides = {}, handler) {
     const storage = new Map(Object.entries({ provider: 'vertex', vertexServiceAccountJson: accountJson, ...overrides }));
@@ -80,8 +80,7 @@ function harness(overrides = {}, handler) {
         chat: (payload, signal) => context.unsafeWindow.fetch('/api/simple-chat', { body: JSON.stringify(payload), signal }),
         field: id => elements.get('ph-' + id),
         tokens: () => calls.filter(call => call.url.includes('oauth2')),
-        requests: () => calls.filter(call => call.url.includes('aiplatform')),
-        preview: () => context.document.body.children.findLast(el => el['aria-label'] === 'Live chat reply')
+        requests: () => calls.filter(call => call.url.includes('aiplatform'))
     };
 }
 
@@ -486,7 +485,7 @@ async function until(predicate) {
 }
 
 for (const provider of ['google', 'vertex']) {
-    test(`${provider} delivers JSON chunks and live preview before completion, preserving leaveChat`, async () => {
+    test(`${provider} delivers chat JSON chunks before completion without extra UI, preserving leaveChat`, async () => {
         let input;
         const stream = new ReadableStream({ start(controller) { input = controller; } });
         const h = harness({ provider, apiKey: 'studio-key', modelName: 'gemini-3.8-flash', vertexModel: 'gemini-3.8-flash', thinkingLevel: 'HIGH', vertexThinkingLevel: 'HIGH' }, request =>
@@ -503,8 +502,8 @@ for (const provider of ['google', 'vertex']) {
         for (const byte of first) input.enqueue(Uint8Array.of(byte));
         const firstChunk = await firstRead;
         assert.equal(new TextDecoder().decode(firstChunk.value), '{"message":"Прив');
-        assert.equal(h.preview().children[2].textContent, 'Прив');
-        assert(!h.preview().removed);
+        assert.equal(h.htmls.length, 0);
+        assert.equal(h.elements.size, 0);
         const request = h.calls.at(-1);
         assert.match(request.url, /:streamGenerateContent\?alt=sse$/);
         assert.equal(request.responseType, 'stream');
@@ -522,7 +521,6 @@ for (const provider of ['google', 'vertex']) {
         assert.deepEqual(JSON.parse(all), { message: 'Привет\n"мир"', leaveChat: 'Ушёл' });
         assert.deepEqual(await (await duplicate).json(), JSON.parse(all));
         assert.equal(h.calls.filter(call => call.responseType === 'stream').length, 1);
-        assert(h.preview().removed);
         assert.equal(h.originalCalls.length, 0);
     });
 }
@@ -558,7 +556,6 @@ for (const [name, result, expected] of [
         await assert.rejects(response.text(), expected);
         assert.equal(h.originalCalls.length, 0);
         assert.equal(h.calls.length, 1);
-        assert.match(h.preview().children[1].textContent, /^Ошибка:/);
     });
 }
 
@@ -571,7 +568,6 @@ test('AbortSignal cancels an active provider stream and clears inflight state', 
     await until(() => h.calls.length === 1);
     abort.abort();
     await assert.rejects(read, { name: 'AbortError' });
-    assert.equal(h.preview().children[1].textContent, 'Генерация отменена');
     const secondAbort = new AbortController();
     const second = await h.chat(payload, secondAbort.signal);
     const secondRead = second.text();
@@ -586,19 +582,12 @@ test('cancelling the returned body aborts generation without an unhandled reject
     const response = await h.chat({ prompt: 'hello', promptStage: 'chatWithUser', stream: true });
     await until(() => h.calls.length === 1);
     await response.body.cancel();
-    await until(() => h.preview().children[1].textContent === 'Генерация отменена');
+    await new Promise(resolve => setImmediate(resolve));
     assert.equal(h.originalCalls.length, 0);
 });
 
-test('partial message preview decodes escapes and waits for incomplete sequences', () => {
-    const h = harness();
-    assert.equal(h.partialChatMessage('{"message":"Hi\\n\\"😀\\"\\u041f\\u04'), 'Hi\n"😀"П');
-    assert.equal(h.partialChatMessage('{"message":"Hi\\'), 'Hi');
-    assert.equal(h.partialChatMessage('{"message":"Hi","leaveChat":"bye"}'), 'Hi');
-});
-
-test('actions, advisor and other providers stay buffered; streaming preference is saved', async () => {
-    for (const payload of [{ promptStage: 'jumpForward', stream: true, jsonSchema: chatSchema }, { promptStage: 'chatWithAdvisor', stream: true, jsonSchema: chatSchema }, { promptStage: 'chatWithUser' }]) {
+test('other actions, advisor and other providers stay buffered; streaming preference is saved', async () => {
+    for (const payload of [{ promptStage: 'actions', stream: true, jsonSchema: chatSchema }, { promptStage: 'chatWithAdvisor', stream: true, jsonSchema: chatSchema }, { promptStage: 'chatWithUser' }]) {
         const h = harness();
         await h.chat({ prompt: 'hello', ...payload });
         assert(h.requests().every(call => !call.responseType));
@@ -655,6 +644,126 @@ test('a network error after a text delta errors the response without issuing ano
     assert.equal(new TextDecoder().decode((await reader.read()).value), 'partial');
     h.calls[0].onerror();
     await assert.rejects(reader.read(), /network error/);
+    assert.equal(h.calls.length, 1);
+    assert.equal(h.originalCalls.length, 0);
+});
+
+const eventSchema = {
+    name: 'jumpForward', schema: {
+        type: 'object', properties: {
+            events: { type: 'array', items: { type: 'object', properties: {
+                date: { type: 'string' }, description: { type: 'string' }, mapChanges: { type: 'array', items: { type: 'object' } }
+            }, required: ['date', 'description', 'mapChanges'] } }
+        }, required: ['events']
+    }
+};
+
+for (const provider of ['google', 'vertex']) {
+    test(`${provider} streams a complete first event before the rest of the turn`, async () => {
+        let input;
+        const stream = new ReadableStream({ start(controller) { input = controller; } });
+        const h = harness({ provider, apiKey: 'key', vertexModel: 'gemini-3.8-flash', vertexThinkingLevel: 'LOW' }, request =>
+            request.url.includes('oauth2') ? { access_token: 'token', expires_in: 3600 } : { stream });
+        const payload = { prompt: 'next month', promptStage: 'jumpForwardStageOne', stream: true, jsonSchema: eventSchema };
+        const response = await h.chat(payload);
+        const duplicate = h.chat(payload);
+        const reader = response.body.getReader();
+        await until(() => h.calls.some(call => call.responseType === 'stream'));
+        const firstEvent = { date: '1900-01-02', description: 'Открыта торговля. {Quote: "да"}', mapChanges: [] };
+        const secondEvent = { date: '1900-01-03', description: 'Second event', mapChanges: [] };
+        const firstText = '{"events":[' + JSON.stringify(firstEvent);
+        input.enqueue(sse(firstText));
+        const firstChunk = new TextDecoder().decode((await reader.read()).value);
+        assert.equal(firstChunk, firstText);
+        assert.deepEqual(JSON.parse(firstChunk.slice('{"events":['.length)), firstEvent);
+        assert.throws(() => JSON.parse(firstChunk));
+        assert.equal(h.htmls.length, 0);
+        assert.equal(h.elements.size, 0);
+        const config = JSON.parse(h.calls.at(-1).data).generationConfig;
+        assert.equal(config.responseMimeType, 'application/json');
+        assert.equal(config.responseSchema.properties.events.type, 'array');
+        if (provider === 'vertex') assert.deepEqual(config.thinkingConfig, { thinkingLevel: 'LOW' });
+        input.enqueue(sse(',' + JSON.stringify(secondEvent) + ']}', 'STOP'));
+        input.close();
+        let text = firstChunk;
+        for (;;) { const chunk = await reader.read(); if (chunk.done) break; text += new TextDecoder().decode(chunk.value); }
+        assert.deepEqual(JSON.parse(text), { events: [firstEvent, secondEvent] });
+        assert.deepEqual(await (await duplicate).json(), JSON.parse(text));
+        assert.equal(h.calls.filter(call => call.responseType === 'stream').length, 1);
+        assert.equal(h.originalCalls.length, 0);
+    });
+}
+
+test('all manual and auto jump stages stream without requiring a chat message', async () => {
+    for (const promptStage of ['jumpForward', 'autoJumpForward', 'jumpForwardStageOne', 'jumpForwardStageTwo', 'jumpForwardStageThree', 'autoJumpForwardStageOne', 'autoJumpForwardStageTwo', 'autoJumpForwardStageThree']) {
+        const h = harness({ provider: 'google', apiKey: 'key' }, () => ({ stream: finiteStream(sse('{"events":[]}', 'STOP')) }));
+        assert.deepEqual(await (await h.chat({ prompt: 'jump', promptStage, stream: true, jsonSchema: eventSchema })).json(), { events: [] });
+        assert.equal(h.calls[0].responseType, 'stream');
+    }
+});
+
+test('event streaming can be disabled and saved independently of chat streaming', async () => {
+    const h = harness();
+    h.createSettingsModal();
+    assert.equal(h.field('stream-events').checked, true);
+    h.field('stream-events').checked = false;
+    await h.field('save-btn').fire('click');
+    assert.equal(h.loadSettings().streamEvents, false);
+    assert.equal(h.loadSettings().streamChats, true);
+    await h.chat({ prompt: 'jump', promptStage: 'jumpForwardStageOne', stream: true, jsonSchema: eventSchema });
+    assert(h.requests().every(call => !call.responseType));
+    h.createSettingsModal();
+    assert.equal(h.field('stream-events').checked, false);
+});
+
+for (const provider of ['google', 'vertex']) {
+    test(`${provider} event streaming falls back from a rejected schema before any text arrives`, async () => {
+        let requests = 0;
+        const h = harness({ provider, apiKey: 'key' }, request => request.url.includes('oauth2') ? { access_token: 'token', expires_in: 3600 } :
+            ++requests === 1 ? { status: 400, stream: finiteStream(new TextEncoder().encode('{"error":{"message":"schema rejected"}}')) } :
+                { stream: finiteStream(sse('{"events":[]}', 'STOP')) });
+        const response = await h.chat({ prompt: 'jump', promptStage: 'jumpForwardStageOne', stream: true, jsonSchema: eventSchema });
+        assert.deepEqual(await response.json(), { events: [] });
+        const bodies = h.calls.filter(call => call.responseType === 'stream').map(call => JSON.parse(call.data));
+        assert.equal(bodies.length, 2);
+        assert(bodies[0].generationConfig.responseSchema);
+        assert(!bodies[1].generationConfig.responseSchema);
+        assert.equal(bodies[1].generationConfig.responseMimeType, 'application/json');
+        assert.match(bodies[1].contents[0].parts[0].text, /matching this schema/);
+        assert.equal(h.originalCalls.length, 0);
+    });
+}
+
+test('schema fallback and token refresh do not loop on a permanently rejected event request', async () => {
+    const h = harness({}, request => request.url.includes('oauth2') ? { access_token: 'token', expires_in: 3600 } :
+        { status: 400, stream: finiteStream(new TextEncoder().encode('{"error":{"message":"bad schema"}}')) });
+    const response = await h.chat({ prompt: 'jump', promptStage: 'jumpForwardStageOne', stream: true, jsonSchema: eventSchema });
+    await assert.rejects(response.text(), /bad schema/);
+    assert.equal(h.requests().length, 2);
+    assert.equal(h.originalCalls.length, 0);
+});
+
+test('cancelling an event stream after its first event stops further reads and clears deduplication', async () => {
+    let input;
+    const h = harness({ provider: 'google', apiKey: 'key' }, () => ({ stream: new ReadableStream({ start(controller) { input = controller; } }) }));
+    const payload = { prompt: 'jump', promptStage: 'autoJumpForwardStageOne', stream: true, jsonSchema: eventSchema };
+    const response = await h.chat(payload);
+    const reader = response.body.getReader();
+    await until(() => h.calls.length === 1);
+    input.enqueue(sse('{"events":[{"date":"1900-01-02","description":"first","mapChanges":[]}'));
+    assert.match(new TextDecoder().decode((await reader.read()).value), /"events"/);
+    await reader.cancel();
+    await new Promise(resolve => setImmediate(resolve));
+    const next = await h.chat(payload);
+    await until(() => h.calls.length === 2);
+    await next.body.cancel();
+    assert.equal(h.originalCalls.length, 0);
+});
+
+test('a truncated event stream fails instead of repairing JSON and silently completing the turn', async () => {
+    const h = harness({ provider: 'google', apiKey: 'key' }, () => ({ stream: finiteStream(sse('{"events":[{', 'MAX_TOKENS')) }));
+    const response = await h.chat({ prompt: 'jump', promptStage: 'jumpForwardStageOne', stream: true, jsonSchema: eventSchema });
+    await assert.rejects(response.text(), /MAX_TOKENS/);
     assert.equal(h.calls.length, 1);
     assert.equal(h.originalCalls.length, 0);
 });

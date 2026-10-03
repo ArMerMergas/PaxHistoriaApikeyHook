@@ -97,13 +97,13 @@ models and select one (e.g. `gpt-4.1`,
 
 5. Save and reload the page.
 
-## Streaming country chats
+## Native streaming
 
-**Stream chats with live preview** is enabled by default for Google AI Studio and Vertex AI. It applies to country conversations (`chatWithUser`) when the game requests streaming. Gemini's [`streamGenerateContent`](https://ai.google.dev/api/generate-content#method:-models.streamgeneratecontent) SSE response is read through [Tampermonkey's stream API](https://www.tampermonkey.net/documentation.php?q=GM_xmlhttpRequest), and text chunks are forwarded through `Response.body`.
+**Stream chats** and **Stream events (jump forward)** are enabled by default for Google AI Studio and Vertex AI. Gemini's [`streamGenerateContent`](https://ai.google.dev/api/generate-content#method:-models.streamgeneratecontent) SSE response is read through [Tampermonkey's stream API](https://www.tampermonkey.net/documentation.php?q=GM_xmlhttpRequest). Text chunks are forwarded through `Response.body` to the game's own parsers and interface.
 
-The game's current country-chat parser displays a JSON `message` only after its closing quote. A small live preview shows the message during generation and disappears after success; the completed reply stays in the normal chat. The preview's close button hides it without cancelling generation. JSON replies preserve `leaveChat`, and thinking text is excluded. Actions, advisor calls and other providers keep the existing buffered behavior.
+Country chats (`chatWithUser`) preserve `leaveChat`; the game's current parser displays `message` after its closing quote. There is no separate preview window. Events stream during manual and automatic jump forward, including all three generation stages. The game validates complete event objects and handles its own queue, animations, next-event button and intervention controls. Its **Stream events** game setting controls automatic queue playback independently of the userscript's transport setting. Other action types, advisor calls and other providers keep the existing buffered behavior. Thinking text is excluded.
 
-Disable the checkbox in **AI Settings** to return to buffered replies. Streaming requires a Tampermonkey version with `responseType: "stream"` support. Cancellation, an interrupted stream, blocked output or invalid JSON produces an error; a partially streamed request is never retried or forwarded to the game's default backend. A Vertex HTTP 401 refreshes the token once before any text has been emitted.
+Disable either checkbox in **AI Settings** to return that request type to buffered replies. Streaming requires a Tampermonkey version with `responseType: "stream"` support. Cancellation, an interrupted stream, blocked output or invalid JSON produces an error; a partially streamed request is never retried or forwarded to the game's default backend. Before any text has been emitted, a Vertex HTTP 401 refreshes the token once, and a schema HTTP 400 can retry once with the schema in the prompt. Event cancellation uses the game's normal controls and stops the provider stream.
 
 ## Troubleshooting
 

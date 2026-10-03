@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pax Historia: Custom AI Backend (Multi-Provider)
 // @namespace    http://tampermonkey.net/
-// @version      15.5
+// @version      15.6
 // @description  Custom AI backend for Pax Historia. Supports Google, Vertex AI, OpenRouter, OpenAI, Groq, Ollama, LM Studio, Together, Fireworks, Mistral, Anthropic, Copilot, Generic, DeepSeek.
 // @author       You
 // @match        https://paxhistoria.co/*
@@ -133,7 +133,8 @@
         genericApiKey: "",
         thinkingBudget: -1,
         thinkingLevel: "default",
-        streamChats: true
+        streamChats: true,
+        streamEvents: true
     };
 
     // === SETTINGS MANAGEMENT ===
@@ -186,7 +187,8 @@
             genericApiKey: GM_getValue("genericApiKey", DEFAULTS.genericApiKey),
             thinkingBudget: GM_getValue("thinkingBudget", DEFAULTS.thinkingBudget),
             thinkingLevel: GM_getValue("thinkingLevel", DEFAULTS.thinkingLevel),
-            streamChats: GM_getValue("streamChats", DEFAULTS.streamChats)
+            streamChats: GM_getValue("streamChats", DEFAULTS.streamChats),
+            streamEvents: GM_getValue("streamEvents", DEFAULTS.streamEvents)
         };
     }
 
@@ -226,6 +228,7 @@
         GM_setValue("thinkingBudget", settings.thinkingBudget);
         GM_setValue("thinkingLevel", settings.thinkingLevel);
         GM_setValue("streamChats", settings.streamChats);
+        GM_setValue("streamEvents", settings.streamEvents);
     }
 
     const MAX_RETRIES = 3;
@@ -476,7 +479,7 @@
     }
 
     function streamAbortError() {
-        const error = new Error("Chat generation cancelled");
+        const error = new Error("Generation cancelled");
         error.name = "AbortError";
         return error;
     }
@@ -561,7 +564,7 @@
                         } finally { reader.releaseLock(); }
                     },
                     onload: function () {
-                        if (!started) finish(new Error('Streaming is unavailable. Update Tampermonkey or disable Stream chats in AI Settings.'));
+                        if (!started) finish(new Error('Streaming is unavailable. Update Tampermonkey or disable streaming in AI Settings.'));
                     },
                     onerror: function () { finish(new Error('Gemini stream network error')); },
                     ontimeout: function () { finish(new Error('Gemini stream timed out')); },
@@ -571,53 +574,7 @@
         });
     }
 
-    function partialChatMessage(text) {
-        const match = /"message"\s*:\s*"/.exec(text);
-        if (!match) return '';
-        let value = '';
-        for (let i = match.index + match[0].length; i < text.length; i++) {
-            const char = text[i];
-            if (char === '"') break;
-            if (char !== '\\') { value += char; continue; }
-            const escape = text[++i];
-            if (!escape) break;
-            if (escape === 'u') {
-                const hex = text.slice(i + 1, i + 5);
-                if (!/^[0-9a-f]{4}$/i.test(hex)) break;
-                value += String.fromCharCode(parseInt(hex, 16));
-                i += 4;
-            } else {
-                const escapes = { '"': '"', '\\': '\\', '/': '/', n: '\n', r: '\r', t: '\t', b: '\b', f: '\f' };
-                if (!(escape in escapes)) break;
-                value += escapes[escape];
-            }
-        }
-        return value;
-    }
-
-    function createChatPreview() {
-        const box = document.createElement('section');
-        box.style.cssText = 'position:fixed;right:16px;bottom:16px;width:min(440px,calc(100vw - 32px));max-height:45vh;overflow:auto;background:#222;color:#fff;border:1px solid #555;border-radius:8px;padding:12px;box-sizing:border-box;z-index:9999;font:14px/1.5 system-ui;box-shadow:0 4px 20px #0008;';
-        box.setAttribute('aria-label', 'Live chat reply');
-        const title = document.createElement('div');
-        title.textContent = 'Ответ генерируется…';
-        const close = document.createElement('button');
-        close.textContent = '×';
-        close.setAttribute('aria-label', 'Hide live reply');
-        close.style.cssText = 'float:right;background:transparent;border:0;color:inherit;font-size:20px;cursor:pointer;';
-        close.addEventListener('click', function () { box.remove(); });
-        const content = document.createElement('div');
-        content.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;margin-top:8px;';
-        box.appendChild(close); box.appendChild(title); box.appendChild(content);
-        document.body.appendChild(box);
-        return {
-            update: function (text) { content.textContent = text; box.scrollTop = box.scrollHeight; },
-            complete: function () { box.remove(); },
-            fail: function (error) { title.textContent = error.name === 'AbortError' ? 'Генерация отменена' : 'Ошибка: ' + error.message; }
-        };
-    }
-
-    function createGeminiChatResponse(settings, prompt, schema, signal, onComplete, onFailure) {
+    function createGeminiStreamResponse(settings, prompt, schema, signal, isChat, onComplete, onFailure) {
         const isVertex = settings.provider === 'vertex';
         const generationConfig = isVertex ? getVertexGenerationConfig(settings) : getGoogleGenerationConfig(settings);
         if (schema) {
@@ -629,7 +586,6 @@
         const forwardAbort = function () { abortController.abort(); };
         if (signal?.aborted) forwardAbort();
         else signal?.addEventListener('abort', forwardAbort, { once: true });
-        const preview = createChatPreview();
         const encoder = new TextEncoder();
         let cancelled = false;
         const body = new unsafeWindow.ReadableStream({
@@ -646,37 +602,45 @@
                             headers['x-goog-api-key'] = settings.apiKey;
                         }
                         let emitted = false;
-                        function delta(part, text) {
+                        function delta(part) {
                             if (cancelled || abortController.signal.aborted) throw streamAbortError();
                             if (!emitted && !schema) controller.enqueue(encoder.encode('{"message":"'));
                             emitted = true;
                             controller.enqueue(encoder.encode(schema ? part : JSON.stringify(part).slice(1, -1)));
-                            preview.update(schema ? partialChatMessage(text) : text);
                         }
                         let text;
-                        try { text = await fetchGeminiStream(url, payload, headers, delta, abortController.signal); }
-                        catch (error) {
-                            if (!isVertex || error.status !== 401 || emitted || abortController.signal.aborted) throw error;
-                            if (vertexTokenCache?.source === settings.vertexServiceAccountJson && headers.Authorization === 'Bearer ' + vertexTokenCache.token) vertexTokenCache.expiresAt = 0;
-                            headers.Authorization = 'Bearer ' + await getVertexAccessToken(settings);
-                            text = await fetchGeminiStream(url, payload, headers, delta, abortController.signal);
+                        let refreshedToken = false, schemaFallback = false;
+                        for (;;) {
+                            try {
+                                text = await fetchGeminiStream(url, payload, headers, delta, abortController.signal);
+                                break;
+                            } catch (error) {
+                                if (emitted || abortController.signal.aborted) throw error;
+                                if (isVertex && error.status === 401 && !refreshedToken) {
+                                    refreshedToken = true;
+                                    if (vertexTokenCache?.source === settings.vertexServiceAccountJson && headers.Authorization === 'Bearer ' + vertexTokenCache.token) vertexTokenCache.expiresAt = 0;
+                                    headers.Authorization = 'Bearer ' + await getVertexAccessToken(settings);
+                                } else if (error.status === 400 && schema && !schemaFallback) {
+                                    schemaFallback = true;
+                                    delete generationConfig.responseSchema;
+                                    payload.contents[0].parts[0].text = prompt + '\n\nYou must respond with a valid JSON object matching this schema:\n' + JSON.stringify(schema.schema || schema);
+                                } else throw error;
+                            }
                         }
                         if (cancelled || abortController.signal.aborted) throw streamAbortError();
                         let responseBody;
                         if (schema) {
                             const parsed = JSON.parse(text);
-                            if (typeof parsed.message !== 'string') throw new Error('Gemini returned an invalid chat message');
+                            if (isChat && typeof parsed.message !== 'string') throw new Error('Gemini returned an invalid chat message');
                             responseBody = text;
                         } else {
                             controller.enqueue(encoder.encode('"}'));
                             responseBody = JSON.stringify({ message: text });
                         }
                         controller.close();
-                        preview.complete();
                         onComplete({ body: responseBody, status: 200, headers: { 'Content-Type': 'application/json' } });
                     } catch (error) {
                         if (!cancelled) controller.error(error);
-                        preview.fail(error);
                         onFailure(error);
                     } finally { signal?.removeEventListener('abort', forwardAbort); }
                 })();
@@ -1029,8 +993,9 @@
                     </select>
 
                     <div id="ph-stream-fields" style="display: ${['google', 'vertex'].includes(settings.provider) ? 'block' : 'none'};">
-                        <label><input id="ph-stream-chats" type="checkbox" style="width: auto;"> Stream chats with live preview</label>
-                        <p style="font-size: 0.8rem; color: #aaa;">Gemini / Vertex country chats only. Actions stay buffered.</p>
+                        <label><input id="ph-stream-chats" type="checkbox" style="width: auto;"> Stream chats</label>
+                        <label><input id="ph-stream-events" type="checkbox" style="width: auto;"> Stream events (jump forward)</label>
+                        <p style="font-size: 0.8rem; color: #aaa;">Gemini / Vertex. Uses the game's built-in display and event queue.</p>
                     </div>
 
                     <div id="ph-api-key-container" style="display: ${['vertex', 'ollama', 'lmstudio', 'copilot', 'generic'].indexOf(settings.provider) !== -1 ? 'none' : 'block'};">
@@ -1199,6 +1164,7 @@
         apiKeyInput.value = settings.apiKey;
         document.getElementById('ph-thinking-level').value = settings.thinkingLevel;
         document.getElementById('ph-stream-chats').checked = settings.streamChats;
+        document.getElementById('ph-stream-events').checked = settings.streamEvents;
 
         let vertexCredentialDraft = settings.vertexServiceAccountJson;
         let vertexAccountCleared = false;
@@ -1435,7 +1401,8 @@
                 genericApiKey: getVal('ph-generic-api-key', DEFAULTS.genericApiKey),
                 thinkingBudget: Number(document.getElementById('ph-thinking-budget').value.trim() || DEFAULTS.thinkingBudget),
                 thinkingLevel: getSelectVal('ph-thinking-level', DEFAULTS.thinkingLevel),
-                streamChats: document.getElementById('ph-stream-chats').checked
+                streamChats: document.getElementById('ph-stream-chats').checked,
+                streamEvents: document.getElementById('ph-stream-events').checked
             };
             if (newSettings.provider === 'google') {
                 try { getGoogleGenerationConfig(newSettings); } catch (error) {
@@ -1534,9 +1501,11 @@
                     const payload = JSON.parse(options.body);
                     userPrompt = payload.prompt || "";
 
-                    if (settings.streamChats && payload.stream === true && payload.promptStage === 'chatWithUser' && ['google', 'vertex'].includes(settings.provider)) {
+                    const streamChat = settings.streamChats && payload.promptStage === 'chatWithUser';
+                    const streamEvents = settings.streamEvents && payload.jsonSchema && /^(?:autoJumpForward|jumpForward)(?:Stage(?:One|Two|Three))?$/.test(payload.promptStage);
+                    if (payload.stream === true && (streamChat || streamEvents) && ['google', 'vertex'].includes(settings.provider)) {
                         streamingRequest = true;
-                        return createGeminiChatResponse(settings, userPrompt, payload.jsonSchema, options.signal,
+                        return createGeminiStreamResponse(settings, userPrompt, payload.jsonSchema, options.signal, !!streamChat,
                             function (result) {
                                 if (resolveInflight) resolveInflight(result);
                                 if (reqKey) delete _inflightRequests[reqKey];
