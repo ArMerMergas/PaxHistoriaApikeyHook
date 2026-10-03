@@ -25,6 +25,7 @@ Tampermonkey userscript that replaces **Pax Historia**'s default AI backend with
 
 - **14 providers**: Google, Vertex AI, OpenRouter, OpenAI, Groq, Ollama, LM Studio, Together, Fireworks, Mistral, Anthropic, DeepSeek, Copilot, Generic
 - **Vertex AI service accounts**: Import a JSON key, choose a project/region, and test the selected Gemini model; OAuth tokens refresh automatically
+- **Separate provider keys**: Switching providers restores their own API keys. Save keeps keys edited during the session; Cancel discards those edits. The existing shared key migrates to the currently selected API-key provider.
 - **Connection test**: Verifies Base URL for Copilot, LM Studio, Ollama, Generic before saving
 - **Model selector**: Auto-loads models from local proxies (Copilot, LM Studio)
 - **Thinking Budget**: Configurable for Gemini models

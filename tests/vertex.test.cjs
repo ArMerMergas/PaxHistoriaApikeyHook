@@ -278,3 +278,94 @@ test('Google AI Studio and OpenAI still route with their original credentials', 
     assert.equal(openai.calls[0].url, 'https://api.openai.com/v1/chat/completions');
     assert.equal(openai.calls[0].headers.Authorization, 'Bearer openai-key');
 });
+
+test('the legacy shared key migrates only to its current provider', () => {
+    const h = harness({ provider: 'google', apiKey: 'legacy-google-key' });
+    assert.equal(h.loadSettings().apiKey, 'legacy-google-key');
+    assert.equal(h.storage.get('providerApiKeys').google, 'legacy-google-key');
+    h.storage.set('provider', 'openai');
+    assert.equal(h.loadSettings().apiKey, '');
+    h.storage.set('provider', 'google');
+    assert.equal(h.loadSettings().apiKey, 'legacy-google-key');
+    const cleared = harness({ provider: 'google', apiKey: 'legacy-key', providerApiKeys: { google: '' } });
+    assert.equal(cleared.loadSettings().apiKey, '');
+});
+
+test('switching providers restores individual drafts and Save persists all edited keys', async () => {
+    const h = harness({ provider: 'google', apiKey: 'google-key' });
+    h.createSettingsModal();
+    h.field('api-key').value = 'edited-google-key';
+    h.field('provider').value = 'openai';
+    await h.field('provider').fire('change');
+    assert.equal(h.field('api-key').value, '');
+    h.field('api-key').value = 'openai-key';
+    h.field('provider').value = 'google';
+    await h.field('provider').fire('change');
+    assert.equal(h.field('api-key').value, 'edited-google-key');
+    h.field('provider').value = 'groq';
+    await h.field('provider').fire('change');
+    assert.equal(h.field('api-key').value, '');
+    h.field('provider').value = 'openai';
+    await h.field('provider').fire('change');
+    assert.equal(h.field('api-key').value, 'openai-key');
+    await h.field('save-btn').fire('click');
+    assert.equal(h.storage.get('providerApiKeys').google, 'edited-google-key');
+    assert.equal(h.storage.get('providerApiKeys').openai, 'openai-key');
+    assert.equal(h.loadSettings().apiKey, 'openai-key');
+    h.createSettingsModal();
+    assert.equal(h.field('api-key').value, 'openai-key');
+    h.field('provider').value = 'google';
+    await h.field('provider').fire('change');
+    assert.equal(h.field('api-key').value, 'edited-google-key');
+});
+
+test('Cancel discards key drafts and clearing one key preserves the other providers', async () => {
+    const h = harness({ provider: 'google', providerApiKeys: { google: 'google-key', openai: 'openai-key' }, apiKey: 'legacy-key' });
+    h.createSettingsModal();
+    h.field('api-key').value = 'unsaved-key';
+    h.field('provider').value = 'openai';
+    await h.field('provider').fire('change');
+    await h.field('cancel-btn').fire('click');
+    assert.equal(h.storage.get('providerApiKeys').google, 'google-key');
+    assert.equal(h.storage.get('provider'), 'google');
+    h.createSettingsModal();
+    assert.equal(h.field('api-key').value, 'google-key');
+    h.field('api-key').value = '';
+    await h.field('save-btn').fire('click');
+    assert.equal(h.loadSettings().apiKey, '');
+    assert.equal(h.storage.get('providerApiKeys').openai, 'openai-key');
+});
+
+test('local, Generic and Vertex providers preserve saved cloud keys', async () => {
+    const h = harness({ provider: 'google', apiKey: 'google-key', genericApiKey: 'generic-key' });
+    h.createSettingsModal();
+    for (const provider of ['vertex', 'ollama', 'lmstudio', 'copilot', 'generic']) {
+        h.field('provider').value = provider;
+        await h.field('provider').fire('change');
+        assert.equal(h.field('api-key').value, '');
+        assert.equal(h.field('api-key-container').style.display, 'none');
+    }
+    assert.equal(h.field('generic-api-key').value, 'generic-key');
+    await h.field('save-btn').fire('click');
+    assert.equal(h.storage.get('providerApiKeys').google, 'google-key');
+    assert.equal(h.storage.get('genericApiKey'), 'generic-key');
+    assert.equal(h.storage.get('vertexServiceAccountJson'), accountJson);
+});
+
+test('all API-key providers use their own stored credentials for actual requests', async () => {
+    const providers = ['google', 'openrouter', 'openai', 'groq', 'together', 'fireworks', 'mistral', 'anthropic', 'deepseek'];
+    const keys = Object.fromEntries(providers.map(provider => [provider, provider + '-key']));
+    const h = harness({ provider: 'google', providerApiKeys: keys, apiKey: 'obsolete-shared-key' }, request =>
+        request.url.includes('generativelanguage') ? { candidates: [{ content: { parts: [{ text: 'OK' }] } }] } :
+            request.url.includes('anthropic') ? { content: [{ type: 'text', text: 'OK' }] } :
+                { choices: [{ message: { content: 'OK' } }] });
+    for (const provider of providers) {
+        h.storage.set('provider', provider);
+        const response = await h.chat({ prompt: provider, promptStage: 'chatWithUser' });
+        assert.equal(response.status, 200);
+        const request = h.calls.at(-1);
+        if (provider === 'google') assert.match(request.url, /key=google-key/);
+        else if (provider === 'anthropic') assert.equal(request.headers['x-api-key'], 'anthropic-key');
+        else assert.equal(request.headers.Authorization, 'Bearer ' + provider + '-key');
+    }
+});

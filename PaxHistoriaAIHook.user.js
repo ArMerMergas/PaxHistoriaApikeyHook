@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pax Historia: Custom AI Backend (Multi-Provider)
 // @namespace    http://tampermonkey.net/
-// @version      15.2
+// @version      15.3
 // @description  Custom AI backend for Pax Historia. Supports Google, Vertex AI, OpenRouter, OpenAI, Groq, Ollama, LM Studio, Together, Fireworks, Mistral, Anthropic, Copilot, Generic, DeepSeek.
 // @author       You
 // @match        https://paxhistoria.co/*
@@ -134,10 +134,29 @@
     };
 
     // === SETTINGS MANAGEMENT ===
+    const API_KEY_PROVIDERS = ['google', 'openrouter', 'openai', 'groq', 'together', 'fireworks', 'mistral', 'anthropic', 'deepseek'];
+
+    function loadProviderApiKeys() {
+        const stored = GM_getValue("providerApiKeys", null);
+        const keys = {};
+        API_KEY_PROVIDERS.forEach(function (provider) {
+            if (typeof stored?.[provider] === 'string') keys[provider] = stored[provider];
+        });
+        if (!stored) {
+            const provider = GM_getValue("provider", DEFAULTS.provider);
+            if (API_KEY_PROVIDERS.includes(provider)) keys[provider] = GM_getValue("apiKey", DEFAULTS.apiKey);
+            GM_setValue("providerApiKeys", keys);
+        }
+        return keys;
+    }
+
     function loadSettings() {
+        const provider = GM_getValue("provider", DEFAULTS.provider);
+        const providerApiKeys = loadProviderApiKeys();
         return {
-            provider: GM_getValue("provider", DEFAULTS.provider),
-            apiKey: GM_getValue("apiKey", DEFAULTS.apiKey),
+            provider: provider,
+            apiKey: providerApiKeys[provider] || "",
+            providerApiKeys: providerApiKeys,
             modelName: GM_getValue("modelName", DEFAULTS.modelName),
             vertexServiceAccountJson: GM_getValue("vertexServiceAccountJson", DEFAULTS.vertexServiceAccountJson),
             vertexProjectId: GM_getValue("vertexProjectId", DEFAULTS.vertexProjectId),
@@ -166,8 +185,13 @@
     }
 
     function saveSettings(settings) {
+        const providerApiKeys = loadProviderApiKeys();
+        API_KEY_PROVIDERS.forEach(function (provider) {
+            if (typeof settings.providerApiKeys?.[provider] === 'string') providerApiKeys[provider] = settings.providerApiKeys[provider];
+        });
+        if (API_KEY_PROVIDERS.includes(settings.provider)) providerApiKeys[settings.provider] = (settings.apiKey || "").trim();
+        GM_setValue("providerApiKeys", providerApiKeys);
         GM_setValue("provider", settings.provider);
-        GM_setValue("apiKey", settings.apiKey);
         GM_setValue("modelName", settings.modelName);
         if (settings.vertexServiceAccountJson !== GM_getValue("vertexServiceAccountJson", "")) vertexTokenCache = null;
         GM_setValue("vertexServiceAccountJson", settings.vertexServiceAccountJson);
@@ -769,7 +793,7 @@
 
                     <div id="ph-api-key-container" style="display: ${['vertex', 'ollama', 'lmstudio', 'copilot', 'generic'].indexOf(settings.provider) !== -1 ? 'none' : 'block'};">
                         <label for="ph-api-key">API Key:</label>
-                        <input type="text" id="ph-api-key" value="${settings.apiKey}" placeholder="sk-...">
+                        <input type="text" id="ph-api-key" placeholder="sk-...">
                     </div>
 
                     <div id="ph-google-fields" style="display: ${settings.provider === 'google' ? 'block' : 'none'};">
@@ -905,6 +929,11 @@
         div.innerHTML = modalHTML;
         document.body.appendChild(div);
 
+        const providerApiKeys = { ...settings.providerApiKeys };
+        const apiKeyInput = document.getElementById('ph-api-key');
+        let apiKeyProvider = settings.provider;
+        apiKeyInput.value = settings.apiKey;
+
         let vertexCredentialDraft = settings.vertexServiceAccountJson;
         let vertexAccountCleared = false;
         const vertexJsonInput = document.getElementById('ph-vertex-service-account-json');
@@ -976,6 +1005,9 @@
         // Event Listeners
         function updateProviderVisibility() {
             const provider = document.getElementById('ph-provider').value;
+            if (API_KEY_PROVIDERS.includes(apiKeyProvider)) providerApiKeys[apiKeyProvider] = apiKeyInput.value.trim();
+            apiKeyProvider = provider;
+            apiKeyInput.value = providerApiKeys[provider] || '';
             const noApiKey = ['vertex', 'ollama', 'lmstudio', 'copilot', 'generic'];
             document.getElementById('ph-api-key-container').style.display = noApiKey.indexOf(provider) !== -1 ? 'none' : 'block';
             ['google', 'vertex', 'openrouter', 'openai', 'groq', 'ollama', 'lmstudio', 'together', 'fireworks', 'mistral', 'anthropic', 'deepseek', 'copilot', 'generic'].forEach(function (p) {
@@ -1086,6 +1118,7 @@
         });
 
         document.getElementById('ph-save-btn').addEventListener('click', function () {
+            if (apiKeyProvider !== document.getElementById('ph-provider').value) updateProviderVisibility();
             function getVal(id, def) {
                 var el = document.getElementById(id);
                 return el ? (el.value || "").trim() : (def || "");
@@ -1098,6 +1131,7 @@
             const newSettings = {
                 provider: getVal('ph-provider', DEFAULTS.provider),
                 apiKey: getVal('ph-api-key', DEFAULTS.apiKey),
+                providerApiKeys: providerApiKeys,
                 modelName: getVal('ph-model-name', DEFAULTS.modelName),
                 openRouterModel: getVal('ph-or-model-name', DEFAULTS.openRouterModel),
                 openaiModel: getVal('ph-openai-model', DEFAULTS.openaiModel),
