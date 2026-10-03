@@ -28,7 +28,7 @@ Tampermonkey userscript that replaces **Pax Historia**'s default AI backend with
 - **Separate provider keys**: Switching providers restores their own API keys. Save keeps keys edited during the session; Cancel discards those edits. The existing shared key migrates to the currently selected API-key provider.
 - **Connection test**: Verifies Base URL for Copilot, LM Studio, Ollama, Generic before saving
 - **Model selector**: Auto-loads models from local proxies (Copilot, LM Studio)
-- **Thinking Budget**: Configurable for Gemini models
+- **Gemini thinking controls**: Default / LOW / MEDIUM / HIGH for Gemini 3 (including 3.8) in Google AI Studio and Vertex AI; token budgets for Gemini 2.5
 - **Indicator badge**: Shows current provider and model in the header (click to open settings)
 - **Privacy**: Prompts go to your chosen provider, not the game's default backend
 
@@ -47,8 +47,9 @@ Tampermonkey userscript that replaces **Pax Historia**'s default AI backend with
 
 ### Google AI Studio
 - **API Key**: [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)
-- **Model**: e.g. `gemini-3-flash-preview`
-- **Thinking Budget**: 4096 (recommended)
+- **Model**: e.g. `gemini-3.8-flash`
+- **Thinking Level (Gemini 3)**: Default, LOW, MEDIUM or HIGH. Default omits `thinkingLevel` and uses the model's own setting (`MEDIUM` for Gemini 3.8 Flash). Explicit levels are sent as `generationConfig.thinkingConfig.thinkingLevel`, with no legacy token budget. See [Google's thinking guide](https://ai.google.dev/gemini-api/docs/generate-content/thinking?hl=en).
+- **Thinking Budget (Gemini 2.5)**: `-1` by default (automatic). The form switches between a level selector and a token budget when you change the model.
 
 ### Vertex AI (Gemini / service account)
 
@@ -56,12 +57,13 @@ Tampermonkey userscript that replaces **Pax Historia**'s default AI backend with
 2. In [IAM & Admin → Service Accounts](https://console.cloud.google.com/iam-admin/serviceaccounts), create a service account and grant it **Vertex AI User** (`roles/aiplatform.user`) on the project used for requests.
 3. Open the account's **Keys → Add key → Create new key → JSON** and download the key. See [Google's service account guide](https://developers.google.com/identity/protocols/oauth2/service-account#creatinganaccount).
 4. In the script's AI Settings, choose **Vertex AI (Gemini / service account)** and import the JSON file, or paste its contents.
-5. Leave **Project ID** empty to use `project_id` from the JSON, or enter another project where the account has the required role. Set **Location** to `global` or a supported region such as `us-central1`, and enter a **Gemini model ID** (default: `gemini-2.5-flash`). Model availability varies by location; see [Google's endpoint list](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/learn/locations).
+5. Leave **Project ID** empty to use `project_id` from the JSON, or enter another project where the account has the required role. Set **Location** to `global` or a supported region such as `us-central1`, and enter a **Gemini model ID**, such as `gemini-3.8-flash` (default: `gemini-3.5-flash`). Model availability varies by location; see [Google's endpoint list](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/learn/locations).
 6. Use **Test connection** to send a short request to that model, then click **Save**. The test uses Google Cloud quota and may incur usage charges.
 
 The script signs an RS256 JWT using the browser's Web Crypto API, exchanges it for a Google OAuth access token, and refreshes it before expiry. No proxy or manual token copying is needed. Gemini chat and structured JSON actions use the same game response format as Google AI Studio.
 
-- **Thinking Budget (Gemini 2.5)**: `4096` by default; `-1` lets the model choose automatically. Use a value supported by your selected model (some models cannot disable thinking with `0`). Other Gemini versions use their default thinking settings, since Gemini 3 and later use a different [thinking configuration](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/thinking).
+- **Thinking Level (Gemini 3, including 3.8)**: Default, LOW, MEDIUM or HIGH. Gemini 3.8 Flash uses `MEDIUM` by default. Selecting a level sends `generationConfig.thinkingConfig.thinkingLevel`; the numeric budget is omitted. Settings are saved separately from Google AI Studio and apply to chats, structured actions and Test connection. See [Google's thinking configuration](https://docs.cloud.google.com/vertex-ai/generative-ai/docs/thinking).
+- **Thinking Budget (Gemini 2.5)**: `-1` by default (automatic). Use a value supported by your selected model (some models cannot disable thinking with `0`). Only the numeric budget is sent for these models; a saved Gemini 3 level is ignored. Other model versions use their default thinking settings.
 - The JSON key is stored in **Tampermonkey storage**. Access tokens stay in memory; the saved private key is not inserted into the settings form when reopened. Treat the JSON as a private credential.
 - An empty JSON field keeps the saved account. **Clear account → Save** removes it. **Cancel** discards credential changes.
 - This provider supports Google Gemini models; partner models such as Claude on Vertex use a different API and are not included.
@@ -94,6 +96,14 @@ models and select one (e.g. `gpt-4.1`,
 - **API Key (optional)**: Leave empty for local or public endpoints
 
 5. Save and reload the page.
+
+## Streaming country chats
+
+**Stream chats with live preview** is enabled by default for Google AI Studio and Vertex AI. It applies to country conversations (`chatWithUser`) when the game requests streaming. Gemini's [`streamGenerateContent`](https://ai.google.dev/api/generate-content#method:-models.streamgeneratecontent) SSE response is read through [Tampermonkey's stream API](https://www.tampermonkey.net/documentation.php?q=GM_xmlhttpRequest), and text chunks are forwarded through `Response.body`.
+
+The game's current country-chat parser displays a JSON `message` only after its closing quote. A small live preview shows the message during generation and disappears after success; the completed reply stays in the normal chat. The preview's close button hides it without cancelling generation. JSON replies preserve `leaveChat`, and thinking text is excluded. Actions, advisor calls and other providers keep the existing buffered behavior.
+
+Disable the checkbox in **AI Settings** to return to buffered replies. Streaming requires a Tampermonkey version with `responseType: "stream"` support. Cancellation, an interrupted stream, blocked output or invalid JSON produces an error; a partially streamed request is never retried or forwarded to the game's default backend. A Vertex HTTP 401 refreshes the token once before any text has been emitted.
 
 ## Troubleshooting
 

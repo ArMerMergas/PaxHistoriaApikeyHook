@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Pax Historia: Custom AI Backend (Multi-Provider)
 // @namespace    http://tampermonkey.net/
-// @version      15.3
+// @version      15.5
 // @description  Custom AI backend for Pax Historia. Supports Google, Vertex AI, OpenRouter, OpenAI, Groq, Ollama, LM Studio, Together, Fireworks, Mistral, Anthropic, Copilot, Generic, DeepSeek.
 // @author       You
 // @match        https://paxhistoria.co/*
@@ -113,6 +113,7 @@
         vertexLocation: "global",
         vertexModel: "gemini-3.5-flash",
         vertexThinkingBudget: -1,
+        vertexThinkingLevel: "default",
         openRouterModel: "google/gemini-2.0-flash-thinking-exp:free",
         openaiModel: "gpt-4o-mini",
         groqModel: "llama-3.1-70b-versatile",
@@ -130,7 +131,9 @@
         genericBaseUrl: "https://api.openai.com/v1",
         genericModel: "gpt-4o-mini",
         genericApiKey: "",
-        thinkingBudget: -1
+        thinkingBudget: -1,
+        thinkingLevel: "default",
+        streamChats: true
     };
 
     // === SETTINGS MANAGEMENT ===
@@ -163,6 +166,7 @@
             vertexLocation: GM_getValue("vertexLocation", DEFAULTS.vertexLocation),
             vertexModel: GM_getValue("vertexModel", DEFAULTS.vertexModel),
             vertexThinkingBudget: GM_getValue("vertexThinkingBudget", DEFAULTS.vertexThinkingBudget),
+            vertexThinkingLevel: GM_getValue("vertexThinkingLevel", DEFAULTS.vertexThinkingLevel),
             openRouterModel: GM_getValue("openRouterModel", DEFAULTS.openRouterModel),
             openaiModel: GM_getValue("openaiModel", DEFAULTS.openaiModel),
             groqModel: GM_getValue("groqModel", DEFAULTS.groqModel),
@@ -180,7 +184,9 @@
             genericBaseUrl: GM_getValue("genericBaseUrl", DEFAULTS.genericBaseUrl),
             genericModel: GM_getValue("genericModel", DEFAULTS.genericModel),
             genericApiKey: GM_getValue("genericApiKey", DEFAULTS.genericApiKey),
-            thinkingBudget: GM_getValue("thinkingBudget", DEFAULTS.thinkingBudget)
+            thinkingBudget: GM_getValue("thinkingBudget", DEFAULTS.thinkingBudget),
+            thinkingLevel: GM_getValue("thinkingLevel", DEFAULTS.thinkingLevel),
+            streamChats: GM_getValue("streamChats", DEFAULTS.streamChats)
         };
     }
 
@@ -199,6 +205,7 @@
         GM_setValue("vertexLocation", settings.vertexLocation);
         GM_setValue("vertexModel", settings.vertexModel);
         GM_setValue("vertexThinkingBudget", settings.vertexThinkingBudget);
+        GM_setValue("vertexThinkingLevel", settings.vertexThinkingLevel);
         GM_setValue("openRouterModel", settings.openRouterModel);
         GM_setValue("openaiModel", settings.openaiModel);
         GM_setValue("groqModel", settings.groqModel);
@@ -217,6 +224,8 @@
         GM_setValue("genericModel", settings.genericModel);
         GM_setValue("genericApiKey", settings.genericApiKey);
         GM_setValue("thinkingBudget", settings.thinkingBudget);
+        GM_setValue("thinkingLevel", settings.thinkingLevel);
+        GM_setValue("streamChats", settings.streamChats);
     }
 
     const MAX_RETRIES = 3;
@@ -337,9 +346,7 @@
         if (!/^[a-zA-Z0-9_-]+$/.test(project)) throw new Error("Vertex AI: enter a valid Google Cloud Project ID.");
         if (!/^(global|[a-z]+(?:-[a-z0-9]+)+)$/.test(location)) throw new Error("Vertex AI: location must be global or a region such as us-central1.");
         if (!/^gemini-[a-zA-Z0-9._-]+$/.test(model)) throw new Error("Vertex AI: enter a Gemini model ID, such as gemini-2.5-flash.");
-        if (!Number.isInteger(settings.vertexThinkingBudget) || settings.vertexThinkingBudget < -1) {
-            throw new Error("Vertex AI: thinking budget must be -1 (automatic), 0, or a positive integer.");
-        }
+        getVertexGenerationConfig(settings);
         const host = location === "global" ? "aiplatform.googleapis.com" : location + "-aiplatform.googleapis.com";
         return {
             account: account,
@@ -352,12 +359,31 @@
             .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
     }
 
-    function getVertexGenerationConfig(settings) {
+    function usesGeminiThinkingLevel(model) {
+        const version = /^gemini-(\d+)(?:[.-]|$)/.exec((model || '').trim());
+        return !!version && Number(version[1]) >= 3;
+    }
+
+    function getGeminiGenerationConfig(model, budget, level) {
         const config = { temperature: 0.7 };
-        if (/^gemini-2\.5-/.test(settings.vertexModel || DEFAULTS.vertexModel)) {
-            config.thinkingConfig = { thinkingBudget: settings.vertexThinkingBudget };
+        if (usesGeminiThinkingLevel(model)) {
+            if (level && level !== 'default') {
+                if (!['LOW', 'MEDIUM', 'HIGH'].includes(level)) throw new Error("Gemini: thinking level must be Default, LOW, MEDIUM or HIGH.");
+                config.thinkingConfig = { thinkingLevel: level };
+            }
+        } else if (/^gemini-2\.5-/.test((model || '').trim())) {
+            if (!Number.isInteger(budget) || budget < -1) throw new Error("Gemini: thinking budget must be -1 (automatic), 0, or a positive integer.");
+            config.thinkingConfig = { thinkingBudget: budget };
         }
         return config;
+    }
+
+    function getVertexGenerationConfig(settings) {
+        return getGeminiGenerationConfig(settings.vertexModel || DEFAULTS.vertexModel, settings.vertexThinkingBudget, settings.vertexThinkingLevel);
+    }
+
+    function getGoogleGenerationConfig(settings) {
+        return getGeminiGenerationConfig(settings.modelName || DEFAULTS.modelName, settings.thinkingBudget, settings.thinkingLevel);
     }
 
     function vertexApiError(result, label) {
@@ -447,6 +473,217 @@
             if (!result.ok && isRetryableError(result.status)) throw vertexApiError(result, "Vertex AI API Error");
             return result;
         });
+    }
+
+    function streamAbortError() {
+        const error = new Error("Chat generation cancelled");
+        error.name = "AbortError";
+        return error;
+    }
+
+    function fetchGeminiStream(url, payload, headers, onText, signal) {
+        return new Promise(function (resolve, reject) {
+            let request, reader, started = false, settled = false;
+            function finish(error, text) {
+                if (settled) return;
+                settled = true;
+                signal?.removeEventListener('abort', abort);
+                if (error) {
+                    reject(error);
+                    request?.abort();
+                    if (reader) reader.cancel().catch(function () {});
+                } else resolve(text);
+            }
+            function abort() {
+                finish(streamAbortError());
+                request?.abort();
+                if (reader) reader.cancel().catch(function () {});
+            }
+            if (signal?.aborted) { abort(); return; }
+            signal?.addEventListener('abort', abort, { once: true });
+            try {
+                request = GM_xmlhttpRequest({
+                    method: 'POST', url: url, headers: headers, data: JSON.stringify(payload),
+                    responseType: 'stream', timeout: 180000,
+                    onloadstart: async function (response) {
+                        if (settled || started || !response.response?.getReader) return;
+                        started = true;
+                        reader = response.response.getReader();
+                        let buffer = '', text = '', errorBody = '', completed = false;
+                        const decoder = new TextDecoder();
+                        const ok = response.status >= 200 && response.status < 300;
+                        function consume(event) {
+                            const data = event.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
+                            if (!data || data === '[DONE]') return;
+                            const chunk = JSON.parse(data);
+                            if (chunk.error) throw new Error(chunk.error.message || 'Gemini stream failed');
+                            if (chunk.promptFeedback?.blockReason) throw new Error('Gemini blocked the response: ' + chunk.promptFeedback.blockReason);
+                            const candidate = chunk.candidates?.[0];
+                            const delta = (candidate?.content?.parts || []).filter(part => !part.thought && typeof part.text === 'string').map(part => part.text).join('');
+                            if (delta) { text += delta; onText(delta, text); }
+                            if (candidate?.finishReason) {
+                                if (candidate.finishReason !== 'STOP') throw new Error('Gemini stopped generation: ' + candidate.finishReason);
+                                completed = true;
+                            }
+                        }
+                        function drain() {
+                            let boundary;
+                            while ((boundary = /\r?\n\r?\n/.exec(buffer))) {
+                                consume(buffer.slice(0, boundary.index));
+                                buffer = buffer.slice(boundary.index + boundary[0].length);
+                            }
+                        }
+                        try {
+                            while (!settled) {
+                                const { done, value } = await reader.read();
+                                if (done) break;
+                                const decoded = typeof value === 'string' ? value : decoder.decode(value, { stream: true });
+                                if (ok) { buffer += decoded; drain(); } else errorBody += decoded;
+                            }
+                            if (settled) return;
+                            if (!ok) {
+                                let detail;
+                                try { detail = JSON.parse(errorBody + decoder.decode()).error?.message; } catch (_) {}
+                                const error = new Error(detail || 'Gemini stream HTTP ' + response.status);
+                                error.status = response.status;
+                                throw error;
+                            }
+                            buffer += decoder.decode();
+                            drain();
+                            if (buffer.trim()) consume(buffer);
+                            if (!completed) throw new Error('Gemini stream ended before generation completed');
+                            if (!text) throw new Error('Gemini returned no text');
+                            finish(null, text);
+                        } catch (error) {
+                            finish(error);
+                            request?.abort();
+                            reader.cancel().catch(function () {});
+                        } finally { reader.releaseLock(); }
+                    },
+                    onload: function () {
+                        if (!started) finish(new Error('Streaming is unavailable. Update Tampermonkey or disable Stream chats in AI Settings.'));
+                    },
+                    onerror: function () { finish(new Error('Gemini stream network error')); },
+                    ontimeout: function () { finish(new Error('Gemini stream timed out')); },
+                    onabort: function () { finish(streamAbortError()); }
+                });
+            } catch (error) { finish(error); }
+        });
+    }
+
+    function partialChatMessage(text) {
+        const match = /"message"\s*:\s*"/.exec(text);
+        if (!match) return '';
+        let value = '';
+        for (let i = match.index + match[0].length; i < text.length; i++) {
+            const char = text[i];
+            if (char === '"') break;
+            if (char !== '\\') { value += char; continue; }
+            const escape = text[++i];
+            if (!escape) break;
+            if (escape === 'u') {
+                const hex = text.slice(i + 1, i + 5);
+                if (!/^[0-9a-f]{4}$/i.test(hex)) break;
+                value += String.fromCharCode(parseInt(hex, 16));
+                i += 4;
+            } else {
+                const escapes = { '"': '"', '\\': '\\', '/': '/', n: '\n', r: '\r', t: '\t', b: '\b', f: '\f' };
+                if (!(escape in escapes)) break;
+                value += escapes[escape];
+            }
+        }
+        return value;
+    }
+
+    function createChatPreview() {
+        const box = document.createElement('section');
+        box.style.cssText = 'position:fixed;right:16px;bottom:16px;width:min(440px,calc(100vw - 32px));max-height:45vh;overflow:auto;background:#222;color:#fff;border:1px solid #555;border-radius:8px;padding:12px;box-sizing:border-box;z-index:9999;font:14px/1.5 system-ui;box-shadow:0 4px 20px #0008;';
+        box.setAttribute('aria-label', 'Live chat reply');
+        const title = document.createElement('div');
+        title.textContent = 'Ответ генерируется…';
+        const close = document.createElement('button');
+        close.textContent = '×';
+        close.setAttribute('aria-label', 'Hide live reply');
+        close.style.cssText = 'float:right;background:transparent;border:0;color:inherit;font-size:20px;cursor:pointer;';
+        close.addEventListener('click', function () { box.remove(); });
+        const content = document.createElement('div');
+        content.style.cssText = 'white-space:pre-wrap;overflow-wrap:anywhere;margin-top:8px;';
+        box.appendChild(close); box.appendChild(title); box.appendChild(content);
+        document.body.appendChild(box);
+        return {
+            update: function (text) { content.textContent = text; box.scrollTop = box.scrollHeight; },
+            complete: function () { box.remove(); },
+            fail: function (error) { title.textContent = error.name === 'AbortError' ? 'Генерация отменена' : 'Ошибка: ' + error.message; }
+        };
+    }
+
+    function createGeminiChatResponse(settings, prompt, schema, signal, onComplete, onFailure) {
+        const isVertex = settings.provider === 'vertex';
+        const generationConfig = isVertex ? getVertexGenerationConfig(settings) : getGoogleGenerationConfig(settings);
+        if (schema) {
+            generationConfig.responseMimeType = 'application/json';
+            generationConfig.responseSchema = convertSchemaForGoogle(schema);
+        }
+        const payload = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: generationConfig };
+        const abortController = new AbortController();
+        const forwardAbort = function () { abortController.abort(); };
+        if (signal?.aborted) forwardAbort();
+        else signal?.addEventListener('abort', forwardAbort, { once: true });
+        const preview = createChatPreview();
+        const encoder = new TextEncoder();
+        let cancelled = false;
+        const body = new unsafeWindow.ReadableStream({
+            start: function (controller) {
+                (async function () {
+                    try {
+                        if (cancelled || abortController.signal.aborted) throw streamAbortError();
+                        let url, headers = { 'Content-Type': 'application/json' };
+                        if (isVertex) {
+                            url = getVertexConfig(settings).url.replace(':generateContent', ':streamGenerateContent?alt=sse');
+                            headers.Authorization = 'Bearer ' + await getVertexAccessToken(settings);
+                        } else {
+                            url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(settings.modelName) + ':streamGenerateContent?alt=sse';
+                            headers['x-goog-api-key'] = settings.apiKey;
+                        }
+                        let emitted = false;
+                        function delta(part, text) {
+                            if (cancelled || abortController.signal.aborted) throw streamAbortError();
+                            if (!emitted && !schema) controller.enqueue(encoder.encode('{"message":"'));
+                            emitted = true;
+                            controller.enqueue(encoder.encode(schema ? part : JSON.stringify(part).slice(1, -1)));
+                            preview.update(schema ? partialChatMessage(text) : text);
+                        }
+                        let text;
+                        try { text = await fetchGeminiStream(url, payload, headers, delta, abortController.signal); }
+                        catch (error) {
+                            if (!isVertex || error.status !== 401 || emitted || abortController.signal.aborted) throw error;
+                            if (vertexTokenCache?.source === settings.vertexServiceAccountJson && headers.Authorization === 'Bearer ' + vertexTokenCache.token) vertexTokenCache.expiresAt = 0;
+                            headers.Authorization = 'Bearer ' + await getVertexAccessToken(settings);
+                            text = await fetchGeminiStream(url, payload, headers, delta, abortController.signal);
+                        }
+                        if (cancelled || abortController.signal.aborted) throw streamAbortError();
+                        let responseBody;
+                        if (schema) {
+                            const parsed = JSON.parse(text);
+                            if (typeof parsed.message !== 'string') throw new Error('Gemini returned an invalid chat message');
+                            responseBody = text;
+                        } else {
+                            controller.enqueue(encoder.encode('"}'));
+                            responseBody = JSON.stringify({ message: text });
+                        }
+                        controller.close();
+                        preview.complete();
+                        onComplete({ body: responseBody, status: 200, headers: { 'Content-Type': 'application/json' } });
+                    } catch (error) {
+                        if (!cancelled) controller.error(error);
+                        preview.fail(error);
+                        onFailure(error);
+                    } finally { signal?.removeEventListener('abort', forwardAbort); }
+                })();
+            },
+            cancel: function () { cancelled = true; abortController.abort(); }
+        });
+        return new unsafeWindow.Response(body, { status: 200, headers: { 'Content-Type': 'application/json' } });
     }
 
     function getModelLabel(settings) {
@@ -791,6 +1028,11 @@
                         <option value="generic" ${settings.provider === 'generic' ? 'selected' : ''}>Generic (URL)</option>
                     </select>
 
+                    <div id="ph-stream-fields" style="display: ${['google', 'vertex'].includes(settings.provider) ? 'block' : 'none'};">
+                        <label><input id="ph-stream-chats" type="checkbox" style="width: auto;"> Stream chats with live preview</label>
+                        <p style="font-size: 0.8rem; color: #aaa;">Gemini / Vertex country chats only. Actions stay buffered.</p>
+                    </div>
+
                     <div id="ph-api-key-container" style="display: ${['vertex', 'ollama', 'lmstudio', 'copilot', 'generic'].indexOf(settings.provider) !== -1 ? 'none' : 'block'};">
                         <label for="ph-api-key">API Key:</label>
                         <input type="text" id="ph-api-key" placeholder="sk-...">
@@ -799,8 +1041,20 @@
                     <div id="ph-google-fields" style="display: ${settings.provider === 'google' ? 'block' : 'none'};">
                         <label for="ph-model-name">Model:</label>
                         <input type="text" id="ph-model-name" value="${settings.modelName}">
-                        <label for="ph-thinking-budget">Thinking Budget (Tokens):</label>
-                        <input type="number" id="ph-thinking-budget" value="${settings.thinkingBudget}">
+                        <div id="ph-google-thinking-level-fields">
+                            <label for="ph-thinking-level">Thinking Level:</label>
+                            <select id="ph-thinking-level">
+                                <option value="default">Default (MEDIUM for Gemini 3.8 Flash)</option>
+                                <option value="LOW">LOW — faster</option>
+                                <option value="MEDIUM">MEDIUM — balanced</option>
+                                <option value="HIGH">HIGH — deeper reasoning</option>
+                            </select>
+                        </div>
+                        <div id="ph-google-thinking-budget-fields">
+                            <label for="ph-thinking-budget">Thinking Budget (Tokens, -1 = automatic):</label>
+                            <input type="number" id="ph-thinking-budget" value="${settings.thinkingBudget}" min="-1" step="1">
+                        </div>
+                        <span id="ph-google-thinking-status" role="status" style="font-size: 0.85rem; color: #dc3545;"></span>
                     </div>
 
                     <div id="ph-vertex-fields" style="display: ${settings.provider === 'vertex' ? 'block' : 'none'};">
@@ -818,10 +1072,20 @@
                         <label for="ph-vertex-location">Location:</label>
                         <input type="text" id="ph-vertex-location" placeholder="global or us-central1">
                         <label for="ph-vertex-model">Gemini model:</label>
-                        <input type="text" id="ph-vertex-model" placeholder="gemini-2.5-flash">
-                        <label for="ph-vertex-thinking-budget">Thinking Budget (Gemini 2.5, -1 = automatic):</label>
-                        <input type="number" id="ph-vertex-thinking-budget" min="-1" step="1">
-                        <p style="font-size: 0.8rem; color: #aaa;">Other Gemini versions use their default thinking settings.</p>
+                        <input type="text" id="ph-vertex-model" placeholder="gemini-3.8-flash">
+                        <div id="ph-vertex-thinking-level-fields">
+                            <label for="ph-vertex-thinking-level">Thinking Level:</label>
+                            <select id="ph-vertex-thinking-level">
+                                <option value="default">Default (MEDIUM for Gemini 3.8 Flash)</option>
+                                <option value="LOW">LOW — faster</option>
+                                <option value="MEDIUM">MEDIUM — balanced</option>
+                                <option value="HIGH">HIGH — deeper reasoning</option>
+                            </select>
+                        </div>
+                        <div id="ph-vertex-thinking-budget-fields">
+                            <label for="ph-vertex-thinking-budget">Thinking Budget (Tokens, -1 = automatic):</label>
+                            <input type="number" id="ph-vertex-thinking-budget" min="-1" step="1">
+                        </div>
                         <div style="margin-top: 8px;">
                             <button id="ph-test-vertex-btn" type="button" style="background: #28a745; color: #fff;">Test connection</button>
                             <span id="ph-vertex-status" role="status" style="font-size: 0.85rem; margin-left: 8px;"></span>
@@ -933,6 +1197,8 @@
         const apiKeyInput = document.getElementById('ph-api-key');
         let apiKeyProvider = settings.provider;
         apiKeyInput.value = settings.apiKey;
+        document.getElementById('ph-thinking-level').value = settings.thinkingLevel;
+        document.getElementById('ph-stream-chats').checked = settings.streamChats;
 
         let vertexCredentialDraft = settings.vertexServiceAccountJson;
         let vertexAccountCleared = false;
@@ -943,7 +1209,22 @@
         document.getElementById('ph-vertex-location').value = settings.vertexLocation;
         document.getElementById('ph-vertex-model').value = settings.vertexModel;
         document.getElementById('ph-vertex-thinking-budget').value = settings.vertexThinkingBudget;
+        document.getElementById('ph-vertex-thinking-level').value = settings.vertexThinkingLevel;
         vertexAccountStatus.textContent = vertexCredentialDraft ? 'Saved account available' : 'No account';
+
+        function updateThinkingFields() {
+            [['google', 'ph-model-name', DEFAULTS.modelName], ['vertex', 'ph-vertex-model', DEFAULTS.vertexModel]].forEach(function ([provider, modelId, fallback]) {
+                const model = document.getElementById(modelId).value.trim() || fallback;
+                document.getElementById('ph-' + provider + '-thinking-level-fields').style.display = usesGeminiThinkingLevel(model) ? 'block' : 'none';
+                document.getElementById('ph-' + provider + '-thinking-budget-fields').style.display = /^gemini-2\.5-/.test(model) ? 'block' : 'none';
+            });
+            document.getElementById('ph-google-thinking-status').textContent = '';
+        }
+        ['ph-model-name', 'ph-vertex-model'].forEach(function (id) {
+            document.getElementById(id).addEventListener('input', updateThinkingFields);
+            document.getElementById(id).addEventListener('change', updateThinkingFields);
+        });
+        updateThinkingFields();
 
         function readVertexSettings() {
             return {
@@ -951,7 +1232,8 @@
                 vertexProjectId: document.getElementById('ph-vertex-project').value.trim(),
                 vertexLocation: document.getElementById('ph-vertex-location').value.trim() || DEFAULTS.vertexLocation,
                 vertexModel: document.getElementById('ph-vertex-model').value.trim() || DEFAULTS.vertexModel,
-                vertexThinkingBudget: Number(document.getElementById('ph-vertex-thinking-budget').value.trim() || DEFAULTS.vertexThinkingBudget)
+                vertexThinkingBudget: Number(document.getElementById('ph-vertex-thinking-budget').value.trim() || DEFAULTS.vertexThinkingBudget),
+                vertexThinkingLevel: document.getElementById('ph-vertex-thinking-level').value || DEFAULTS.vertexThinkingLevel
             };
         }
 
@@ -1004,6 +1286,7 @@
 
         // Event Listeners
         function updateProviderVisibility() {
+            document.getElementById('ph-stream-fields').style.display = ['google', 'vertex'].includes(document.getElementById('ph-provider').value) ? 'block' : 'none';
             const provider = document.getElementById('ph-provider').value;
             if (API_KEY_PROVIDERS.includes(apiKeyProvider)) providerApiKeys[apiKeyProvider] = apiKeyInput.value.trim();
             apiKeyProvider = provider;
@@ -1150,8 +1433,16 @@
                 genericBaseUrl: getVal('ph-generic-base-url', DEFAULTS.genericBaseUrl),
                 genericModel: getVal('ph-generic-model', DEFAULTS.genericModel),
                 genericApiKey: getVal('ph-generic-api-key', DEFAULTS.genericApiKey),
-                thinkingBudget: parseInt(document.getElementById('ph-thinking-budget').value, 10) || DEFAULTS.thinkingBudget
+                thinkingBudget: Number(document.getElementById('ph-thinking-budget').value.trim() || DEFAULTS.thinkingBudget),
+                thinkingLevel: getSelectVal('ph-thinking-level', DEFAULTS.thinkingLevel),
+                streamChats: document.getElementById('ph-stream-chats').checked
             };
+            if (newSettings.provider === 'google') {
+                try { getGoogleGenerationConfig(newSettings); } catch (error) {
+                    document.getElementById('ph-google-thinking-status').textContent = error.message;
+                    return;
+                }
+            }
             const vertexSettings = readVertexSettings();
             try {
                 if (vertexSettings.vertexServiceAccountJson) parseVertexServiceAccount(vertexSettings.vertexServiceAccountJson);
@@ -1200,7 +1491,7 @@
             var reqKey = null;
             try {
                 var bodyStr = options && options.body ? options.body : "";
-                reqKey = bodyStr.length > 100 ? bodyStr.substring(0, 100) + bodyStr.length : bodyStr;
+                reqKey = bodyStr;
             } catch (e) { }
 
             if (reqKey && _inflightRequests[reqKey]) {
@@ -1217,12 +1508,6 @@
             }
 
             var resolveInflight, rejectInflight;
-            if (reqKey) {
-                _inflightRequests[reqKey] = new Promise(function (res, rej) {
-                    resolveInflight = res;
-                    rejectInflight = rej;
-                });
-            }
             const settings = loadSettings();
 
             const noApiKeyProviders = ['vertex', 'ollama', 'lmstudio', 'copilot', 'generic'];
@@ -1231,7 +1516,15 @@
                 console.warn("[PAX AI] No API Key configured. Please open settings via Tampermonkey menu.");
                 return originalFetch(url, options);
             }
+            if (reqKey) {
+                _inflightRequests[reqKey] = new Promise(function (res, rej) {
+                    resolveInflight = res;
+                    rejectInflight = rej;
+                });
+                _inflightRequests[reqKey].catch(function () {});
+            }
 
+            let streamingRequest = false;
             try {
                 let userPrompt = "";
                 let isAction = false;
@@ -1240,6 +1533,19 @@
                 if (options.body) {
                     const payload = JSON.parse(options.body);
                     userPrompt = payload.prompt || "";
+
+                    if (settings.streamChats && payload.stream === true && payload.promptStage === 'chatWithUser' && ['google', 'vertex'].includes(settings.provider)) {
+                        streamingRequest = true;
+                        return createGeminiChatResponse(settings, userPrompt, payload.jsonSchema, options.signal,
+                            function (result) {
+                                if (resolveInflight) resolveInflight(result);
+                                if (reqKey) delete _inflightRequests[reqKey];
+                            },
+                            function (error) {
+                                if (resolveInflight) resolveInflight({ body: JSON.stringify({ error: error.message }), status: 502, headers: { 'Content-Type': 'application/json' } });
+                                if (reqKey) delete _inflightRequests[reqKey];
+                            });
+                    }
 
                     // DETERMINE REQUEST TYPE
                     if (payload.promptStage === "chatWithUser") {
@@ -1264,13 +1570,7 @@
                         const googleUrl = isVertex ? null : `https://generativelanguage.googleapis.com/v1beta/models/${settings.modelName}:generateContent?key=${settings.apiKey}`;
 
                         async function doGoogleRequest(useNativeSchema) {
-                            const genConfig = isVertex ? getVertexGenerationConfig(settings) : {
-                                temperature: 0.7,
-                                thinkingConfig: {
-                                    include_thoughts: true,
-                                    thinking_budget: settings.thinkingBudget
-                                }
-                            };
+                            const genConfig = isVertex ? getVertexGenerationConfig(settings) : getGoogleGenerationConfig(settings);
                             var promptText = finalPrompt;
                             if (isAction && gameSchema) {
                                 if (useNativeSchema) {
@@ -1310,15 +1610,11 @@
                             throw err;
                         }
                         const parts = result.data?.candidates?.[0]?.content?.parts || [];
+                        const text = parts.filter(part => !part.thought && typeof part.text === 'string').map(part => part.text).join('');
                         if (isVertex) {
-                            const text = parts.filter(part => !part.thought && typeof part.text === 'string').map(part => part.text).join('');
                             if (!text) throw new Error("Vertex AI: the model returned no text (" + (result.data?.promptFeedback?.blockReason || result.data?.candidates?.[0]?.finishReason || "empty response") + ").");
-                            return text;
                         }
-                        for (let i = parts.length - 1; i >= 0; i--) {
-                            if (parts[i].text) return parts[i].text;
-                        }
-                        return "";
+                        return text;
                     })();
 
                 } else if (settings.provider === 'anthropic') {
@@ -1512,7 +1808,7 @@
 
             } catch (e) {
                 console.error("[PAX AI] Critical Failure:", e);
-                if (settings.provider === 'vertex') {
+                if (settings.provider === 'vertex' || streamingRequest) {
                     const failure = {
                         body: JSON.stringify({ error: e.message || "Vertex AI request failed" }),
                         status: e.status >= 400 && e.status < 600 ? e.status : 502,
