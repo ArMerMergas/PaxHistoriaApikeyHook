@@ -14,11 +14,12 @@ const account = {
 const accountJson = JSON.stringify(account);
 const source = readFileSync(join(__dirname, '..', 'PaxHistoriaAIHook.user.js'), 'utf8')
     .replace('    ensureIndicator();', '')
-    .replace(/\}\)\(\);\s*$/, 'globalThis.api = { loadSettings, saveSettings, getVertexConfig, getVertexAccessToken, requestVertexApi, createSettingsModal }; })();');
+    .replace(/\}\)\(\);\s*$/, 'globalThis.api = { loadSettings, saveSettings, getVertexConfig, getVertexAccessToken, requestVertexApi, createSettingsModal, fetchGeminiStream, createGameJsonTextTransform, createOrUpdateIndicator }; })();');
 
 function harness(overrides = {}, handler) {
     const storage = new Map(Object.entries({ provider: 'vertex', vertexServiceAccountJson: accountJson, ...overrides }));
     const calls = [], originalCalls = [], logs = [], htmls = [], elements = new Map();
+    const deadlines = new Map();
     let clock = Date.now();
     class Element {
         constructor() { this.style = {}; this.value = ''; this.listeners = {}; this.files = []; this.children = []; }
@@ -44,15 +45,19 @@ function harness(overrides = {}, handler) {
         async fire(event) { return this.listeners[event]({ target: this, currentTarget: this }); }
         appendChild(child) { child.parentNode = this; this.children.push(child); if (child.id) elements.set(child.id, child); }
         remove() { elements.delete(this.id); this.removed = true; }
-        querySelector() { return { textContent: '' }; }
+        querySelector() { return this.indicatorText ||= { textContent: '' }; }
     }
     const context = vm.createContext({
-        crypto: webcrypto, TextEncoder, TextDecoder, AbortController, URLSearchParams, Uint8Array, Response,
+        crypto: webcrypto, TextEncoder, TextDecoder, AbortController, URL, URLSearchParams, Uint8Array, Response,
         btoa: value => Buffer.from(value, 'binary').toString('base64'),
         atob: value => Buffer.from(value, 'base64').toString('binary'),
         Date: class extends Date { static now() { return clock; } },
         console: Object.fromEntries(['log', 'warn', 'error'].map(level => [level, (...args) => logs.push(args)])),
-        setTimeout: fn => queueMicrotask(fn),
+        setTimeout: (fn, ms) => {
+            if (ms >= 10000) { const id = {}; deadlines.set(id, fn); return id; }
+            return setTimeout(fn, 0);
+        },
+        clearTimeout: id => { if (!deadlines.delete(id)) clearTimeout(id); },
         document: { body: new Element(), getElementById: id => elements.get(id) || null, querySelector: () => null, querySelectorAll: () => [], createElement: () => new Element() },
         getComputedStyle: () => ({ display: 'flex' }),
         window: { location: { href: 'https://paxhistoria.co/games/test' } },
@@ -65,7 +70,8 @@ function harness(overrides = {}, handler) {
                 options.url.includes('oauth2') ? { access_token: 'token-' + calls.filter(call => call.url.includes('oauth2')).length, expires_in: 3600 } :
                     { candidates: [{ content: { parts: [{ text: 'OK' }] } }] })
                 .then(result => {
-                    if (result.stream) options.onloadstart({ status: result.status || 200, response: result.stream });
+                    if (result.callbacks) result.callbacks(options);
+                    else if (result.stream) options.onloadstart({ status: result.status || 200, response: result.stream });
                     else options.onload({ status: result.status || 200, responseText: JSON.stringify(result.data || result) });
                 })
                 .catch(error => options.onerror(error));
@@ -75,14 +81,53 @@ function harness(overrides = {}, handler) {
     });
     vm.runInContext(source, context);
     return {
-        ...context.api, storage, calls, originalCalls, logs, htmls, elements,
+        ...context.api, storage, calls, originalCalls, logs, htmls, elements, deadlines,
+        expireDeadlines: () => { for (const [id, fn] of [...deadlines]) { deadlines.delete(id); fn(); } },
         advance: ms => { clock += ms; },
+        setLocation: href => { context.window.location.href = href; },
+        fetch: (...args) => context.unsafeWindow.fetch(...args),
         chat: (payload, signal) => context.unsafeWindow.fetch('/api/simple-chat', { body: JSON.stringify(payload), signal }),
         field: id => elements.get('ph-' + id),
         tokens: () => calls.filter(call => call.url.includes('oauth2')),
         requests: () => calls.filter(call => call.url.includes('aiplatform'))
     };
 }
+
+test('Live navigation reports unsupported server-side generation and restores the legacy indicator', async () => {
+    const h = harness();
+    h.createOrUpdateIndicator();
+    const badge = h.elements.get('ph-ai-indicator');
+    assert.match(badge.html, /VERTEX/);
+    h.setLocation('https://beta.paxhistoria.co/live/test?round=22&view=jumpForward');
+    const placement = await h.fetch('/api/substrate/placement');
+    assert.equal(await placement.text(), 'original');
+    assert.equal(badge.indicatorText.textContent, 'AI HOOK | LIVE UNSUPPORTED');
+    assert.match(badge.title, /server over WebSocket/);
+    assert.equal(h.calls.length, 0);
+    await h.createSettingsModal();
+    assert.match(h.htmls.at(-1), /provider settings do not apply to Live games/);
+    h.setLocation('https://beta.paxhistoria.co/game/test');
+    assert.equal((await h.chat({ prompt: 'hello', promptStage: 'chatWithUser' })).status, 200);
+    assert.match(badge.indicatorText.textContent, /^VERTEX \| /);
+    assert.equal(badge.title, 'Pax AI Hook - Click to open settings');
+    assert.equal(h.requests().length, 1);
+    assert.equal(h.originalCalls.length, 1);
+});
+
+test('Live compatibility notice covers both domains and does not flag similarly named legacy routes', async () => {
+    for (const href of ['https://www.paxhistoria.co/live/test', 'https://beta.paxhistoria.co/live?round=1']) {
+        const h = harness();
+        h.setLocation(href);
+        h.createOrUpdateIndicator();
+        assert.match(h.elements.get('ph-ai-indicator').html, /LIVE UNSUPPORTED/);
+    }
+    const h = harness();
+    h.setLocation('https://beta.paxhistoria.co/game/live-test?view=live');
+    h.createOrUpdateIndicator();
+    assert.match(h.elements.get('ph-ai-indicator').html, /VERTEX/);
+    await h.createSettingsModal();
+    assert.doesNotMatch(h.htmls.at(-1), /provider settings do not apply to Live games/);
+});
 
 test('signs a valid RS256 JWT and sends a form-encoded OAuth exchange to Google', async () => {
     const h = harness();
@@ -501,7 +546,7 @@ for (const provider of ['google', 'vertex']) {
         const first = sse('{"message":"Прив');
         for (const byte of first) input.enqueue(Uint8Array.of(byte));
         const firstChunk = await firstRead;
-        assert.equal(new TextDecoder().decode(firstChunk.value), '{"message":"Прив');
+        assert.equal(new TextDecoder().decode(firstChunk.value), '{"message":');
         assert.equal(h.htmls.length, 0);
         assert.equal(h.elements.size, 0);
         const request = h.calls.at(-1);
@@ -766,4 +811,172 @@ test('a truncated event stream fails instead of repairing JSON and silently comp
     await assert.rejects(response.text(), /MAX_TOKENS/);
     assert.equal(h.calls.length, 1);
     assert.equal(h.originalCalls.length, 0);
+});
+
+function tampermonkeyStream(chunks, status = 200, withHeadersEvent = true) {
+    return { callbacks(options) {
+        let controller;
+        const stream = new ReadableStream({ start(input) { controller = input; } });
+        options.onloadstart({ status: 0, readyState: 1, response: stream });
+        if (withHeadersEvent) options.onreadystatechange({ status, readyState: 2 });
+        chunks.forEach(chunk => controller.enqueue(chunk));
+        options.onreadystatechange({ status, readyState: 4 });
+        options.onload({ status, readyState: 4, response: stream });
+    } };
+}
+
+for (const promptStage of ['chatWithUser', 'jumpForwardStageOne']) {
+    test(`${promptStage} completes when Tampermonkey starts at status 0 and never closes its reader`, async () => {
+        const isChat = promptStage === 'chatWithUser';
+        const result = isChat ? { message: 'Hello world', leaveChat: null } : { events: [{ date: '1900-01-01', description: 'first', mapChanges: [] }] };
+        const text = JSON.stringify(result);
+        const h = harness({ provider: 'google', apiKey: 'key' }, () => tampermonkeyStream([sse(text.slice(0, 10)), sse(text.slice(10), 'STOP')]));
+        const payload = { prompt: 'test', promptStage, stream: true, jsonSchema: isChat ? chatSchema : eventSchema };
+        const response = await h.chat(payload);
+        const duplicate = h.chat(payload);
+        assert.deepEqual(await response.json(), result);
+        assert.deepEqual(await (await duplicate).json(), result);
+        assert.equal(h.deadlines.size, 0);
+        assert.equal(h.calls.length, 1);
+        assert.equal(h.originalCalls.length, 0);
+    });
+}
+
+test('final HTTP status can arrive only in onload, without dropping buffered SSE chunks', async () => {
+    const bytes = sse('Привет 😀', 'STOP');
+    const h = harness({ provider: 'google', apiKey: 'key' }, () => ({ callbacks(options) {
+        let input;
+        const stream = new ReadableStream({ start(controller) { input = controller; } });
+        options.onloadstart({ status: 0, response: stream });
+        for (const byte of bytes) input.enqueue(Uint8Array.of(byte));
+        options.onload({ status: 200, response: stream });
+    } }));
+    const response = await h.chat({ prompt: 'test', promptStage: 'chatWithUser', stream: true });
+    assert.deepEqual(await response.json(), { message: 'Привет 😀' });
+    assert.equal(h.deadlines.size, 0);
+});
+
+test('HTTP errors with status 0 at loadstart are returned after onload without waiting for reader EOF', async () => {
+    const h = harness({ provider: 'google', apiKey: 'key' }, () => tampermonkeyStream([new TextEncoder().encode('{"error":{"message":"permission denied"}}')], 403));
+    const response = await h.chat({ prompt: 'test', promptStage: 'chatWithUser', stream: true });
+    await assert.rejects(response.text(), /permission denied/);
+    assert.equal(h.deadlines.size, 0);
+    assert.equal(h.calls.length, 1);
+    assert.equal(h.originalCalls.length, 0);
+});
+
+test('the independent stream deadline releases a request when Tampermonkey never calls ontimeout', async () => {
+    const h = harness({ provider: 'google', apiKey: 'key' }, () => ({ callbacks(options) {
+        options.onloadstart({ status: 0, response: new ReadableStream() });
+        options.onreadystatechange({ status: 200, readyState: 2 });
+    } }));
+    const response = await h.chat({ prompt: 'test', promptStage: 'chatWithUser', stream: true });
+    const read = response.text();
+    await until(() => h.calls.length === 1);
+    assert.equal(h.deadlines.size, 1);
+    h.expireDeadlines();
+    await assert.rejects(read, /timed out/);
+    assert.equal(h.deadlines.size, 0);
+    assert.equal(h.originalCalls.length, 0);
+});
+
+test('onload without a model finish event errors instead of hanging or silently finishing', async () => {
+    const h = harness({ provider: 'google', apiKey: 'key' }, () => tampermonkeyStream([sse('partial')]));
+    const response = await h.chat({ prompt: 'test', promptStage: 'chatWithUser', stream: true });
+    await assert.rejects(response.text(), /before generation completed/);
+    assert.equal(h.deadlines.size, 0);
+});
+
+test('realistic Tampermonkey callbacks preserve Vertex token refresh and schema fallback', async () => {
+    let attempts = 0;
+    const h = harness({}, request => request.url.includes('oauth2') ? { access_token: 'token-' + h.tokens().length, expires_in: 3600 } :
+        ++attempts === 1 ? tampermonkeyStream([new TextEncoder().encode('{"error":{"message":"expired"}}')], 401) :
+            attempts === 2 ? tampermonkeyStream([new TextEncoder().encode('{"error":{"message":"schema rejected"}}')], 400) :
+                tampermonkeyStream([sse('{"events":[]}', 'STOP')]));
+    const response = await h.chat({ prompt: 'jump', promptStage: 'autoJumpForwardStageOne', stream: true, jsonSchema: eventSchema });
+    assert.deepEqual(await response.json(), { events: [] });
+    assert.equal(h.tokens().length, 2);
+    assert.equal(h.requests().length, 3);
+    assert.equal(h.deadlines.size, 0);
+    assert.equal(h.originalCalls.length, 0);
+});
+
+const escapedQuote = 'Большая игра.\\n\\n> "Мы не можем спокойно взирать." — лорд Пальмерстон';
+const formattedQuote = 'Большая игра.\n\n> "Мы не можем спокойно взирать." — лорд Пальмерстон';
+
+for (const provider of ['google', 'vertex']) {
+    for (const promptStage of ['chatWithUser', 'jumpForwardStageOne']) {
+        test(`${provider} ${promptStage} turns literal paragraph breaks into Markdown before delivering JSON`, async () => {
+            const isChat = promptStage === 'chatWithUser';
+            const result = isChat ? { message: escapedQuote, leaveChat: null } : { events: [{ date: '1850-02-15', description: escapedQuote, mapChanges: [] }] };
+            const json = JSON.stringify(result);
+            const split = json.indexOf('\\\\n') + 1;
+            const h = harness({ provider, apiKey: 'key' }, request => request.url.includes('oauth2') ? { access_token: 'token', expires_in: 3600 } :
+                tampermonkeyStream([sse(json.slice(0, split)), sse(json.slice(split, split + 3)), sse(json.slice(split + 3), 'STOP')]));
+            const payload = { prompt: 'test', promptStage, stream: true, jsonSchema: isChat ? chatSchema : eventSchema };
+            const response = await h.chat(payload);
+            const duplicate = h.chat(payload);
+            const actual = await response.json();
+            assert.equal(isChat ? actual.message : actual.events[0].description, formattedQuote);
+            assert.deepEqual(await (await duplicate).json(), actual);
+            assert.equal(h.calls.filter(call => call.responseType === 'stream').length, 1);
+        });
+    }
+}
+
+test('buffered event and chat replies also normalize literal Markdown breaks', async () => {
+    for (const provider of ['google', 'vertex', 'openai']) {
+        for (const action of [false, true]) {
+            const h = harness({ provider, apiKey: 'key', streamChats: false, streamEvents: false }, request => {
+                if (request.url.includes('oauth2')) return { access_token: 'token', expires_in: 3600 };
+                const text = action ? JSON.stringify({ events: [{ date: '1850-02-15', description: escapedQuote, mapChanges: [] }] }) : escapedQuote;
+                return provider === 'openai' ? { choices: [{ message: { content: text } }] } : { candidates: [{ content: { parts: [{ text }] } }] };
+            });
+            const response = await h.chat({ prompt: 'test', promptStage: action ? 'jumpForwardStageOne' : 'chatWithUser', stream: true, ...(action ? { jsonSchema: eventSchema } : {}) });
+            const actual = await response.json();
+            assert.equal(action ? actual.events[0].description : actual.message, formattedQuote);
+        }
+    }
+});
+
+test('JSON text normalization preserves paths, keys, code samples and already correct escapes at every chunk boundary', () => {
+    const h = harness();
+    const path = 'C:\\new\\notes';
+    const original = {
+        events: [{ description: escapedQuote, date: path, mapChanges: [{ description: 'Текст\\r\\n\\r\\n> Цитата', id: escapedQuote }] }],
+        message: 'Правильный\n\n> Блок\n\n`\\n\\n`\n\n```text\n\\n\\n\n```\n\n' + path,
+        title: 'Строка\\n> цитата',
+        [escapedQuote]: escapedQuote
+    };
+    const expected = structuredClone(original);
+    expected.events[0].description = formattedQuote;
+    expected.events[0].mapChanges[0].description = 'Текст\n\n> Цитата';
+    expected.title = 'Строка\n> цитата';
+    const json = JSON.stringify(original);
+    for (let split = 0; split <= json.length; split++) {
+        const transform = h.createGameJsonTextTransform();
+        const actual = transform.push(json.slice(0, split)) + transform.push(json.slice(split)) + transform.finish();
+        assert.deepEqual(JSON.parse(actual), expected, 'JSON chunk boundary ' + split);
+    }
+    const transform = h.createGameJsonTextTransform();
+    const actual = [...json].map(char => transform.push(char)).join('') + transform.finish();
+    assert.deepEqual(JSON.parse(actual), expected);
+});
+
+test('normalizing event text still lets the first event reach the game before the next event exists', async () => {
+    let input;
+    const h = harness({ provider: 'google', apiKey: 'key' }, () => ({ stream: new ReadableStream({ start(controller) { input = controller; } }) }));
+    const response = await h.chat({ prompt: 'test', promptStage: 'jumpForwardStageOne', stream: true, jsonSchema: eventSchema });
+    const reader = response.body.getReader();
+    await until(() => h.calls.length === 1);
+    const event = { date: '1850-02-15', description: escapedQuote, mapChanges: [] };
+    input.enqueue(sse('{"events":[' + JSON.stringify(event)));
+    const first = new TextDecoder().decode((await reader.read()).value);
+    assert.equal(JSON.parse(first.slice('{"events":['.length)).description, formattedQuote);
+    assert.throws(() => JSON.parse(first));
+    input.enqueue(sse(']}', 'STOP'));
+    input.close();
+    let full = first;
+    for (;;) { const chunk = await reader.read(); if (chunk.done) break; full += new TextDecoder().decode(chunk.value); }
+    assert.equal(JSON.parse(full).events[0].description, formattedQuote);
 });

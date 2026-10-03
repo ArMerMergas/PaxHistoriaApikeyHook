@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Pax Historia: Custom AI Backend (Multi-Provider)
 // @namespace    http://tampermonkey.net/
-// @version      15.6
+// @version      15.10
 // @description  Custom AI backend for Pax Historia. Supports Google, Vertex AI, OpenRouter, OpenAI, Groq, Ollama, LM Studio, Together, Fireworks, Mistral, Anthropic, Copilot, Generic, DeepSeek.
 // @author       You
 // @match        https://paxhistoria.co/*
 // @match        https://www.paxhistoria.co/*
+// @match        https://beta.paxhistoria.co/*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
@@ -486,85 +487,111 @@
 
     function fetchGeminiStream(url, payload, headers, onText, signal) {
         return new Promise(function (resolve, reject) {
-            let request, reader, started = false, settled = false;
+            let request, reader, endTimer, deadlineTimer, started = false, settled = false;
+            let status = 0, buffer = '', text = '', completed = false, readerEnded = false;
+            const decoder = new TextDecoder();
             function finish(error, text) {
                 if (settled) return;
                 settled = true;
+                clearTimeout(endTimer);
+                clearTimeout(deadlineTimer);
                 signal?.removeEventListener('abort', abort);
+                if (reader) reader.cancel().catch(function () {});
                 if (error) {
                     reject(error);
                     request?.abort();
-                    if (reader) reader.cancel().catch(function () {});
                 } else resolve(text);
             }
-            function abort() {
-                finish(streamAbortError());
-                request?.abort();
-                if (reader) reader.cancel().catch(function () {});
+            function abort() { finish(streamAbortError()); }
+            function consume(event) {
+                const data = event.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
+                if (!data || data === '[DONE]') return;
+                const chunk = JSON.parse(data);
+                if (chunk.error) throw new Error(chunk.error.message || 'Gemini stream failed');
+                if (chunk.promptFeedback?.blockReason) throw new Error('Gemini blocked the response: ' + chunk.promptFeedback.blockReason);
+                const candidate = chunk.candidates?.[0];
+                const delta = (candidate?.content?.parts || []).filter(part => !part.thought && typeof part.text === 'string').map(part => part.text).join('');
+                if (delta) { text += delta; onText(delta, text); }
+                if (candidate?.finishReason) {
+                    if (candidate.finishReason !== 'STOP') throw new Error('Gemini stopped generation: ' + candidate.finishReason);
+                    completed = true;
+                }
+            }
+            function drain() {
+                if (status < 200 || status >= 300) return;
+                let boundary;
+                while ((boundary = /\r?\n\r?\n/.exec(buffer))) {
+                    const event = buffer.slice(0, boundary.index);
+                    buffer = buffer.slice(boundary.index + boundary[0].length);
+                    consume(event);
+                }
+            }
+            function updateStatus(response) {
+                if (response.status > 0) status = response.status;
+                drain();
+            }
+            function complete() {
+                if (settled) return;
+                try {
+                    buffer += decoder.decode();
+                    if (status < 200 || status >= 300) {
+                        let detail;
+                        try { detail = JSON.parse(buffer).error?.message; } catch (_) {}
+                        const error = new Error(detail || 'Gemini stream HTTP ' + status);
+                        error.status = status;
+                        throw error;
+                    }
+                    drain();
+                    if (buffer.trim()) consume(buffer);
+                    if (!completed) throw new Error('Gemini stream ended before generation completed');
+                    if (!text) throw new Error('Gemini returned no text');
+                    finish(null, text);
+                } catch (error) { finish(error); }
+            }
+            async function readStream(response) {
+                if (settled || started || !response.response?.getReader) return;
+                started = true;
+                try {
+                    reader = response.response.getReader();
+                    updateStatus(response);
+                    while (!settled) {
+                        const { done, value } = await reader.read();
+                        if (settled) break;
+                        if (done) {
+                            readerEnded = true;
+                            if (status > 0) complete();
+                            break;
+                        }
+                        buffer += typeof value === 'string' ? value : decoder.decode(value, { stream: true });
+                        drain();
+                    }
+                } catch (error) { finish(error); }
+                finally { reader?.releaseLock(); }
             }
             if (signal?.aborted) { abort(); return; }
             signal?.addEventListener('abort', abort, { once: true });
+            deadlineTimer = setTimeout(function () { finish(new Error('Gemini stream timed out')); }, 180000);
             try {
                 request = GM_xmlhttpRequest({
                     method: 'POST', url: url, headers: headers, data: JSON.stringify(payload),
                     responseType: 'stream', timeout: 180000,
-                    onloadstart: async function (response) {
-                        if (settled || started || !response.response?.getReader) return;
-                        started = true;
-                        reader = response.response.getReader();
-                        let buffer = '', text = '', errorBody = '', completed = false;
-                        const decoder = new TextDecoder();
-                        const ok = response.status >= 200 && response.status < 300;
-                        function consume(event) {
-                            const data = event.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
-                            if (!data || data === '[DONE]') return;
-                            const chunk = JSON.parse(data);
-                            if (chunk.error) throw new Error(chunk.error.message || 'Gemini stream failed');
-                            if (chunk.promptFeedback?.blockReason) throw new Error('Gemini blocked the response: ' + chunk.promptFeedback.blockReason);
-                            const candidate = chunk.candidates?.[0];
-                            const delta = (candidate?.content?.parts || []).filter(part => !part.thought && typeof part.text === 'string').map(part => part.text).join('');
-                            if (delta) { text += delta; onText(delta, text); }
-                            if (candidate?.finishReason) {
-                                if (candidate.finishReason !== 'STOP') throw new Error('Gemini stopped generation: ' + candidate.finishReason);
-                                completed = true;
-                            }
-                        }
-                        function drain() {
-                            let boundary;
-                            while ((boundary = /\r?\n\r?\n/.exec(buffer))) {
-                                consume(buffer.slice(0, boundary.index));
-                                buffer = buffer.slice(boundary.index + boundary[0].length);
-                            }
-                        }
+                    onloadstart: readStream,
+                    onreadystatechange: function (response) {
+                        if (settled) return;
                         try {
-                            while (!settled) {
-                                const { done, value } = await reader.read();
-                                if (done) break;
-                                const decoded = typeof value === 'string' ? value : decoder.decode(value, { stream: true });
-                                if (ok) { buffer += decoded; drain(); } else errorBody += decoded;
-                            }
-                            if (settled) return;
-                            if (!ok) {
-                                let detail;
-                                try { detail = JSON.parse(errorBody + decoder.decode()).error?.message; } catch (_) {}
-                                const error = new Error(detail || 'Gemini stream HTTP ' + response.status);
-                                error.status = response.status;
-                                throw error;
-                            }
-                            buffer += decoder.decode();
-                            drain();
-                            if (buffer.trim()) consume(buffer);
-                            if (!completed) throw new Error('Gemini stream ended before generation completed');
-                            if (!text) throw new Error('Gemini returned no text');
-                            finish(null, text);
-                        } catch (error) {
-                            finish(error);
-                            request?.abort();
-                            reader.cancel().catch(function () {});
-                        } finally { reader.releaseLock(); }
+                            updateStatus(response);
+                            if (readerEnded && status > 0) complete();
+                        } catch (error) { finish(error); }
                     },
-                    onload: function () {
-                        if (!started) finish(new Error('Streaming is unavailable. Update Tampermonkey or disable streaming in AI Settings.'));
+                    onload: function (response) {
+                        if (settled) return;
+                        try {
+                            readStream(response);
+                            updateStatus(response);
+                            if (!started) { finish(new Error('Streaming is unavailable. Update Tampermonkey or disable streaming in AI Settings.')); return; }
+                            // Tampermonkey can finish the request without closing its reader.
+                            endTimer = setTimeout(complete, 0);
+                        } catch (error) { finish(error); }
                     },
                     onerror: function () { finish(new Error('Gemini stream network error')); },
                     ontimeout: function () { finish(new Error('Gemini stream timed out')); },
@@ -572,6 +599,63 @@
                 });
             } catch (error) { finish(error); }
         });
+    }
+
+    const GAME_TEXT_FIELDS = new Set(['title', 'description', 'message', 'initialMessage', 'summary', 'passage', 'initialPassage', 'settingDescription']);
+
+    function normalizeMarkdownBreaks(text) {
+        return text.replace(/(`+|~{3,})[\s\S]*?\1|(?:\\r\\n|\\n){2,}|(?:\\r\\n|\\n)(?=[ \t]*>)/g,
+            function (match, code) { return code ? match : match.replace(/\\r\\n|\\n/g, '\n'); });
+    }
+
+    function normalizeGameText(value) {
+        if (!value || typeof value !== 'object') return value;
+        for (const key of Object.keys(value)) {
+            if (GAME_TEXT_FIELDS.has(key) && typeof value[key] === 'string') value[key] = normalizeMarkdownBreaks(value[key]);
+            else if (value[key] && typeof value[key] === 'object') normalizeGameText(value[key]);
+        }
+        return value;
+    }
+
+    function createGameJsonTextTransform() {
+        let token = '', whitespace = '', field = null, inString = false, escaped = false, pending = false;
+        function flush(next) {
+            let result = token;
+            if (next === ':') field = JSON.parse(token);
+            else {
+                if (GAME_TEXT_FIELDS.has(field)) {
+                    const value = JSON.parse(token);
+                    const normalized = normalizeMarkdownBreaks(value);
+                    if (normalized !== value) result = JSON.stringify(normalized);
+                }
+                field = null;
+            }
+            result += whitespace;
+            token = ''; whitespace = ''; pending = false;
+            return result;
+        }
+        return {
+            push: function (part) {
+                let result = '';
+                for (const char of part) {
+                    if (inString) {
+                        token += char;
+                        if (escaped) escaped = false;
+                        else if (char === '\\') escaped = true;
+                        else if (char === '"') { inString = false; pending = true; }
+                        continue;
+                    }
+                    if (pending) {
+                        if (/\s/.test(char)) { whitespace += char; continue; }
+                        result += flush(char);
+                    }
+                    if (char === '"') { token = char; inString = true; }
+                    else result += char;
+                }
+                return result;
+            },
+            finish: function () { return pending ? flush('') : token; }
+        };
     }
 
     function createGeminiStreamResponse(settings, prompt, schema, signal, isChat, onComplete, onFailure) {
@@ -587,6 +671,8 @@
         if (signal?.aborted) forwardAbort();
         else signal?.addEventListener('abort', forwardAbort, { once: true });
         const encoder = new TextEncoder();
+        const jsonTransform = schema ? createGameJsonTextTransform() : null;
+        let formattedText = '';
         let cancelled = false;
         const body = new unsafeWindow.ReadableStream({
             start: function (controller) {
@@ -606,7 +692,9 @@
                             if (cancelled || abortController.signal.aborted) throw streamAbortError();
                             if (!emitted && !schema) controller.enqueue(encoder.encode('{"message":"'));
                             emitted = true;
-                            controller.enqueue(encoder.encode(schema ? part : JSON.stringify(part).slice(1, -1)));
+                            const output = schema ? jsonTransform.push(part) : JSON.stringify(part).slice(1, -1);
+                            if (schema) formattedText += output;
+                            if (output) controller.enqueue(encoder.encode(output));
                         }
                         let text;
                         let refreshedToken = false, schemaFallback = false;
@@ -630,9 +718,12 @@
                         if (cancelled || abortController.signal.aborted) throw streamAbortError();
                         let responseBody;
                         if (schema) {
-                            const parsed = JSON.parse(text);
+                            const tail = jsonTransform.finish();
+                            formattedText += tail;
+                            const parsed = JSON.parse(formattedText);
                             if (isChat && typeof parsed.message !== 'string') throw new Error('Gemini returned an invalid chat message');
-                            responseBody = text;
+                            if (tail) controller.enqueue(encoder.encode(tail));
+                            responseBody = formattedText;
                         } else {
                             controller.enqueue(encoder.encode('"}'));
                             responseBody = JSON.stringify({ message: text });
@@ -722,13 +813,24 @@
         }
     }
 
+    const LIVE_GAME_NOTICE = "Live games run AI on the Pax Historia server over WebSocket. This hook only supports /api/simple-chat; provider settings do not apply to Live games.";
+
+    function isLiveGame() {
+        return /^\/live(?:\/|$)/.test(new URL(window.location.href).pathname);
+    }
+
+    function getIndicatorTitle() {
+        return isLiveGame() ? LIVE_GAME_NOTICE : "Pax AI Hook - Click to open settings";
+    }
+
     function createOrUpdateIndicator() {
         if (!document.body) return;
         var settings = loadSettings();
         var existing = document.getElementById("ph-ai-indicator");
-        var label = settings.provider.toUpperCase() + " | " + getModelLabel(settings);
+        var label = isLiveGame() ? "AI HOOK | LIVE UNSUPPORTED" : settings.provider.toUpperCase() + " | " + getModelLabel(settings);
         if (existing) {
             existing.querySelector(".ph-ai-indicator-text").textContent = label;
+            existing.title = getIndicatorTitle();
             existing.style.background = "rgb(40, 20, 60)";
             existing.style.color = "#fafafa";
             existing.style.position = "";
@@ -756,7 +858,7 @@
         box.id = "ph-ai-indicator";
         box.className = "ph-ai-indicator-btn";
         box.innerHTML = '<span class="ph-ai-indicator-text">' + label + '</span>';
-        box.title = "Pax AI Hook - Click to open settings";
+        box.title = getIndicatorTitle();
         var indicatorBg = "rgb(40, 20, 60)";
         var indicatorHover = "rgb(56, 32, 84)";
         Object.assign(box.style, {
@@ -973,6 +1075,7 @@
             <div id="ph-ai-settings-modal">
                 <div id="ph-ai-modal-box">
                     <h2>AI Settings</h2>
+                    ${isLiveGame() ? `<p role="status" style="color: #ffc107;">${LIVE_GAME_NOTICE}</p>` : ''}
                     
                     <label for="ph-provider">Provider:</label>
                     <select id="ph-provider">
@@ -1454,6 +1557,8 @@
     var _inflightRequests = {};
 
     unsafeWindow.fetch = async function (url, options) {
+        var indicator = document.getElementById("ph-ai-indicator");
+        if (indicator && indicator.title !== getIndicatorTitle()) createOrUpdateIndicator();
         if (url && url.toString().includes('/api/simple-chat')) {
             var reqKey = null;
             try {
@@ -1749,13 +1854,13 @@
                     // The game expects the inner fields at the top level, so we unwrap
                     // single-key object wrappers automatically.
                     try {
-                        const parsed = JSON.parse(cleanText);
+                        const parsed = normalizeGameText(JSON.parse(cleanText));
                         const keys = Object.keys(parsed);
                         if (keys.length === 1 && typeof parsed[keys[0]] === 'object' && !Array.isArray(parsed[keys[0]])) {
                             console.log(`%c[PAX AI] Unwrapped root key "${keys[0]}"`, "color: cyan");
                             responseBody = JSON.stringify(parsed[keys[0]]);
                         } else {
-                            responseBody = cleanText;
+                            responseBody = JSON.stringify(parsed);
                         }
                     } catch {
                         responseBody = cleanText;
@@ -1763,7 +1868,7 @@
                 } else {
                     // FOR CHAT: Wrap in message object
                     // Game expects: { "message": "Hello" }
-                    responseBody = JSON.stringify({ message: cleanText });
+                    responseBody = JSON.stringify({ message: normalizeMarkdownBreaks(cleanText) });
                 }
 
                 var resultResponse = { body: responseBody, status: 200, headers: { "Content-Type": "application/json" } };

@@ -2,6 +2,8 @@
 
 Tampermonkey userscript that replaces **Pax Historia**'s default AI backend with multiple providers. Use your own API keys or local proxies (Ollama, LM Studio, Copilot API) for AI chats and actions.
 
+Supports the legacy game flow that calls `/api/simple-chat`. The script also loads on `beta.paxhistoria.co`, but the new `/live/...` games use WebSocket commands and server-side AI generation, so custom providers do not apply there. These pages show **AI HOOK | LIVE UNSUPPORTED**, with an explanation in AI Settings. Adding a domain match does not enable the Live protocol.
+
 ## Supported Providers
 
 | Provider | API Key | Description |
@@ -41,7 +43,7 @@ Tampermonkey userscript that replaces **Pax Historia**'s default AI backend with
 
 ## Configuration
 
-1. Open [Pax Historia](https://paxhistoria.co).
+1. Open [Pax Historia](https://paxhistoria.co) or [Pax Historia Beta](https://beta.paxhistoria.co). The script loads on `paxhistoria.co`, `www.paxhistoria.co`, and `beta.paxhistoria.co`; AI interception requires the legacy `/api/simple-chat` flow, not `/live/...`.
 2. Click **Tampermonkey** icon and select **"Open AI Settings"**, or click the indicator badge in the header.
 3. Choose provider and configure:
 
@@ -105,8 +107,13 @@ Country chats (`chatWithUser`) preserve `leaveChat`; the game's current parser d
 
 Disable either checkbox in **AI Settings** to return that request type to buffered replies. Streaming requires a Tampermonkey version with `responseType: "stream"` support. Cancellation, an interrupted stream, blocked output or invalid JSON produces an error; a partially streamed request is never retried or forwarded to the game's default backend. Before any text has been emitted, a Vertex HTTP 401 refreshes the token once, and a schema HTTP 400 can retry once with the schema in the prompt. Event cancellation uses the game's normal controls and stops the provider stream.
 
+The transport reads the HTTP status from header/completion callbacks, since Tampermonkey can report `0` at `onloadstart`. It also handles `onload` as completion when Tampermonkey leaves the stream reader open, and enforces its own three-minute deadline. Version 15.7 fixes chats and event generation hanging under these conditions. The fix was checked through real Tampermonkey against a local SSE endpoint and with short live Vertex chat/event requests. These API checks did not advance or save a game turn.
+
+Version 15.8 normalizes literal `\n\n` paragraph breaks and `\n>` quote breaks in display text fields such as event `description` and chat `message`. These sequences sometimes survive JSON decoding because the model escapes them twice. Streamed JSON is corrected as each text field completes, so event delivery stays incremental. Buffered responses are corrected too. Existing newlines, identifiers, file paths and Markdown code samples are preserved. This affects new replies; it does not rewrite events already saved in the game.
+
 ## Troubleshooting
 
+- **Beta / Live still asks for Pax tokens**: `/live/...` uses server-side AI over WebSocket and is not supported by this userscript. The selected custom provider only applies to the legacy `/api/simple-chat` flow. This is unrelated to Permissions-Policy or blocked Vercel analytics warnings.
 - **"No events" error**: The model did not return valid JSON. Try a more capable model or increase the thinking budget.
 - **Copilot API: Network error or no connection**: Ensure the proxy is running (`npx copilot-api@latest start`) and the Base URL is correct.
 - **Script not working**: Check that the script is enabled in Tampermonkey and that you have accepted the requested permissions (including `GM_xmlhttpRequest` for Copilot API).
